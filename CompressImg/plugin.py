@@ -82,7 +82,7 @@ class CompressApp:
         self.prefs = self.load_prefs()
         
         # Configure overall style and layout
-        self.root.title("图片压缩插件 V1.1")
+        self.root.title("CompressImg-Pro V1.1")
         self.root.geometry("1050x800")
         self.root.minsize(1000, 750)
         self.root.eval('tk::PlaceWindow . center')
@@ -342,7 +342,7 @@ class CompressApp:
         self.rb_conv_lossless = ttk.Radiobutton(inner_conv, text="无损转换", variable=self.var_conv_type, value="lossless", command=self.update_states)
         self.rb_conv_lossless.grid(row=2, column=0, sticky=tk.W, pady=5)
         
-        self.combo_conv_lossless_level = ttk.Combobox(inner_conv, values=[f"{i}级" for i in range(8)], state="readonly", width=12)
+        self.combo_conv_lossless_level = ttk.Combobox(inner_conv, values=[f"{i}级" for i in range(10)], state="readonly", width=12)
         self.combo_conv_lossless_level.set(self.prefs.get('conv_lossless_lvl', '2级'))
         self.combo_conv_lossless_level.grid(row=2, column=1, sticky=tk.W, pady=5, padx=10)
         
@@ -387,7 +387,7 @@ class CompressApp:
         ttk.Checkbutton(inner_adv, text="启用无损压缩", variable=self.var_lossless_cmp, command=lambda: self.on_mode_change('advanced')).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         
         ttk.Label(inner_adv, text="无损压缩级别:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.combo_adv_lossless = ttk.Combobox(inner_adv, values=[f"{i}级" for i in range(8)], state="readonly", width=12)
+        self.combo_adv_lossless = ttk.Combobox(inner_adv, values=[f"{i}级" for i in range(10)], state="readonly", width=12)
         self.combo_adv_lossless.set(self.prefs.get('lossless_lvl', '2级'))
         self.combo_adv_lossless.grid(row=2, column=1, sticky=tk.W, padx=10)
 
@@ -728,8 +728,8 @@ class CompressApp:
                     save_kwargs['compress_level'] = min(9, lvl)
                 if target_fmt == 'WEBP':
                     save_kwargs['lossless'] = True
-                    # WEBP 无损模式下 method 决定压缩耗时和体积（范围 0-6）
-                    save_kwargs['method'] = min(6, max(0, lvl - 1))
+                    # WEBP 无损模式下 method 决定压缩耗时和体积（范围 0-6），超过6的视同最高级
+                    save_kwargs['method'] = min(6, lvl)
                     
             # Write compressed output to memory
             out_io = BytesIO()
