@@ -10,18 +10,20 @@ import traceback
 import json
 import re
 import posixpath
+import tempfile
+import atexit
 from io import BytesIO
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from urllib.parse import unquote, quote
 
-# ==========================================
-# 1. 插件路径与第三方依赖加载
-# ==========================================
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _VENDOR_DIR = _PLUGIN_DIR / "vendor"
+MAX_PIXELS = 100_000_000  # 100 Megapixels upper bound safety threshold
 
 def setup_environment():
+    """初始化运行环境与 vendor 依赖包路径"""
     if not _VENDOR_DIR.exists():
         _VENDOR_DIR.mkdir(parents=True, exist_ok=True)
         
@@ -33,7 +35,6 @@ def setup_environment():
         try:
             os.add_dll_directory(vendor_path)
             for item in _VENDOR_DIR.iterdir():
-                # 兼容包含动态链接库的包
                 if item.is_dir() and (item.name.endswith('.libs') or item.name == 'imagequant'):
                     os.add_dll_directory(str(item))
         except Exception:
@@ -42,78 +43,305 @@ def setup_environment():
 setup_environment()
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, font as tkfont
 
-# Check for Pillow library, handled securely in run() if missing
-try:
-    import PIL
-    from PIL import Image, UnidentifiedImageError
-except ImportError:
+_RE_COVER_META_1 = re.compile(r'<meta\s+[^>]*?name=["\']cover["\']\s+content=["\']([^"\']+)["\']', re.IGNORECASE)
+_RE_COVER_META_2 = re.compile(r'<meta\s+[^>]*?content=["\']([^"\']+)["\']\s+name=["\']cover["\']', re.IGNORECASE)
+_RE_IMG_REF = re.compile(
+    r'(?:<(?:img|image|source)[^>]*?(?:src|xlink:href|href)\s*=\s*[\'"]([^\'"]+)[\'"]|url\(\s*[\'"]?([^\'"]+?)[\'"]?\s*\))',
+    re.IGNORECASE
+)
+_RE_SRCSET = re.compile(
+    r'srcset\s*=\s*(?:(["\'])(.*?)(?:\1)|([^\s>]+))',
+    re.IGNORECASE | re.DOTALL
+)
+_RE_HTML_IMG = re.compile(r'(<(?:img|image|source)[^>]*?(?:src|xlink:href|href)\s*=\s*)([\'"])(.*?)([\'"])([^>]*?>)', re.IGNORECASE)
+_RE_HTML_SRCSET = re.compile(
+    r'(<(?:img|image|source)[^>]*?srcset\s*=\s*)(?:([\'"])(.*?)([\'"])|([^\s>]+))([^>]*?>)',
+    re.IGNORECASE | re.DOTALL
+)
+_RE_CSS_URL = re.compile(r'(\burl\s*\(\s*)([\'"]?)(.*?)([\'"]?\s*\))', re.IGNORECASE)
+_RE_CSS_IMPORT = re.compile(r'(@import\s+)([\'"])(.*?)([\'"])', re.IGNORECASE)
+
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg', '.tif', '.tiff', '.ico')
+
+class _DummyUnidentifiedImageError(Exception):
     pass
 
-# ==========================================
-# 2. 依赖检查机制
-# ==========================================
+try:
+    import PIL
+    from PIL import Image, ImageTk, UnidentifiedImageError, ImageOps
+    Image.MAX_IMAGE_PIXELS = MAX_PIXELS
+except ImportError:
+    Image = None
+    ImageTk = None
+    UnidentifiedImageError = _DummyUnidentifiedImageError
+    ImageOps = None
+
+HAS_IMAGEQUANT = False
+try:
+    import imagequant
+    if hasattr(imagequant, 'quantize_pil_image'):
+        HAS_IMAGEQUANT = True
+except Exception:
+    HAS_IMAGEQUANT = False
+
+def split_url_suffix(url_str):
+    """拆分 URL 路径与 Query / Hash 后缀"""
+    q_idx = url_str.find('?')
+    h_idx = url_str.find('#')
+    
+    split_idx = -1
+    if q_idx != -1 and h_idx != -1:
+        split_idx = min(q_idx, h_idx)
+    elif q_idx != -1:
+        split_idx = q_idx
+    elif h_idx != -1:
+        split_idx = h_idx
+        
+    if split_idx != -1:
+        return url_str[:split_idx], url_str[split_idx:]
+    return url_str, ""
+
+def normalize_epub_path(base_file_href, rel_url):
+    """
+    统一 EPUB 规范化路径计算。
+    支持相对路径 (../Images/pic.png) 与根绝对路径 (/Images/pic.png)。
+    """
+    if not rel_url:
+        return "", ""
+        
+    clean_url, extra_suffix = split_url_suffix(rel_url)
+    unquoted = unquote(clean_url).replace('\\', '/')
+    
+    if not unquoted or unquoted.startswith(('data:', 'http:', 'https:', 'mailto:', 'javascript:', 'ftp:')):
+        return "", ""
+        
+    # [优化 3] 应对 /Images/foo.jpg 等根路径引用
+    if unquoted.startswith('/'):
+        norm_path = posixpath.normpath(unquoted.lstrip('/'))
+    elif base_file_href:
+        base_dir = posixpath.dirname(base_file_href)
+        norm_path = posixpath.normpath(posixpath.join(base_dir, unquoted))
+    else:
+        norm_path = posixpath.normpath(unquoted)
+        
+    return norm_path, extra_suffix
+
+def get_relative_epub_path(from_file_href, target_book_path):
+    """计算 from_file_href 到 target_book_path 的 POSIX 相对路径"""
+    from_dir = posixpath.dirname(from_file_href)
+    try:
+        rel = posixpath.relpath(target_book_path, from_dir)
+    except Exception:
+        rel = target_book_path
+    return rel.replace('\\', '/')
+
+def safe_decode_text(data):
+    """[优化 4] 安全解析 XML/SVG/HTML 文本编码，避免盲目丢弃字节"""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, bytes):
+        return str(data)
+        
+    # 尝试解析 xml 头部声明的 encoding
+    match = re.search(rb'^\s*<\?xml[^>]*encoding=["\']([^"\']+)["\']', data, re.IGNORECASE)
+    if match:
+        enc = match.group(1).decode('ascii', errors='ignore')
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            pass
+            
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+        
+    # 终极降级方案：使用 replace 替换无法解析的字节，不破坏可解析的主要字符
+    return data.decode('utf-8', errors='replace')
+
+def get_resample_filter(cur_w, cur_h, new_w, new_h):
+    """根据缩放比例动态选择重采样滤波器，避免大幅缩小时重度计算过载"""
+    if Image is None:
+        return None
+
+    res_obj = getattr(Image, 'Resampling', Image)
+    filter_box = getattr(res_obj, 'BOX', getattr(Image, 'BOX', getattr(Image, 'BILINEAR', 2)))
+    filter_bicubic = getattr(res_obj, 'BICUBIC', getattr(Image, 'BICUBIC', 3))
+    filter_lanczos = getattr(res_obj, 'LANCZOS', getattr(Image, 'LANCZOS', 1))
+
+    if cur_w <= 0 or cur_h <= 0 or new_w <= 0 or new_h <= 0:
+        return filter_lanczos
+
+    scale_ratio = (new_w * new_h) / float(cur_w * cur_h)
+    
+    if scale_ratio < 0.25:
+        return filter_box
+    elif scale_ratio < 0.6:
+        return filter_bicubic
+    
+    return filter_lanczos
+
+def convert_cmyk_to_rgb(img):
+    """更精确地将 CMYK / 印刷色彩空间转换为 RGB，避免色彩反转与失真"""
+    if img is None or img.mode != 'CMYK':
+        return img
+
+    try:
+        from PIL import ImageCms
+        if 'icc_profile' in img.info and img.info['icc_profile']:
+            in_profile = ImageCms.ImageCmsProfile(BytesIO(img.info['icc_profile']))
+            srgb_profile = ImageCms.createProfile('sRGB')
+            return ImageCms.profileToProfile(img, in_profile, srgb_profile, outputMode='RGB')
+    except Exception:
+        pass
+    
+    try:
+        return img.convert('RGB')
+    except Exception:
+        return img
+
+def should_reencode_image(img_info, opts, img_obj):
+    """
+    [优化 1] 显式决策函数：统一判定图片是否需要重新编码。
+    防止 JPEG “无损压缩”下无像素修改却被有损重编码破坏图质。
+    """
+    orig_fmt = img_obj.format if img_obj.format else img_info['format']
+    if orig_fmt.upper() == 'JPG': orig_fmt = 'JPEG'
+    
+    target_fmt = opts['conv_target'] if opts.get('do_conv') else orig_fmt
+    if target_fmt.upper() == 'JPG': target_fmt = 'JPEG'
+    
+    exif_rot_needed = False
+    if hasattr(img_obj, 'getexif'):
+        try:
+            exif = img_obj.getexif()
+            if exif and exif.get(0x0112, 1) not in (1, 0, None):
+                exif_rot_needed = True
+        except Exception:
+            pass
+
+    if img_obj.mode == 'CMYK':
+        return True, target_fmt
+
+    rot = img_info.get('rotate', 0)
+    if rot != 0 or exif_rot_needed:
+        return True, target_fmt
+        
+    if opts.get('do_conv') and target_fmt != orig_fmt:
+        return True, target_fmt
+        
+    if opts.get('do_scale'):
+        stype = opts.get('scale_type')
+        cur_w, cur_h = img_obj.size
+        if rot % 360 in (90, 270):
+            cur_w, cur_h = cur_h, cur_w
+            
+        if stype == "percent" and opts.get('scale_percent') != 100:
+            return True, target_fmt
+        elif stype == "width" and opts.get('scale_width') != cur_w:
+            return True, target_fmt
+        elif stype == "height" and opts.get('scale_height') != cur_h:
+            return True, target_fmt
+
+    if opts.get('do_depth') and target_fmt == 'PNG':
+        if img_obj.mode != 'P':
+            return True, target_fmt
+
+    # JPEG 无损判定：若原图即为 JPEG，且未做尺寸/旋转改变，亦无元数据剥离需求，跳过像素重编码
+    is_lossless_mode = opts.get('do_lossless') or (opts.get('do_conv') and opts.get('conv_type') == 'lossless')
+    if target_fmt == 'JPEG' and is_lossless_mode and orig_fmt == 'JPEG':
+        if not opts.get('strip_meta'):
+            return False, target_fmt
+
+    if opts.get('do_qlty') or (opts.get('do_conv') and opts.get('conv_type') == 'quality'):
+        if target_fmt in ('JPEG', 'WEBP'):
+            return True, target_fmt
+
+    if is_lossless_mode:
+        return True, target_fmt
+
+    if opts.get('strip_meta'):
+        if hasattr(img_obj, 'getexif') and img_obj.getexif():
+            return True, target_fmt
+        if 'icc_profile' in img_obj.info or 'exif' in img_obj.info:
+            return True, target_fmt
+
+    return False, target_fmt
+
 def check_dependencies():
+    """检查依赖库 Pillow 是否安装并符合版本需求"""
+    errors = []
     try:
         import PIL
         from PIL import Image
         
-        # 版本检查逻辑
         def _parse_version(v_str):
             match = re.search(r'^(\d+\.\d+(\.\d+)?)', str(v_str))
             return tuple(map(int, match.group(1).split('.'))) if match else (0, 0, 0)
             
         if hasattr(PIL, '__version__') and _parse_version(PIL.__version__) < (8, 0):
-            return f"Pillow 版本过低 (当前 {PIL.__version__}，需 >= 8.0.0)"
-            
-        return None
+            errors.append(f"Pillow 版本过低 (当前 {PIL.__version__}，需 >= 8.0.0)")
     except Exception as e:
-        return str(e)
+        errors.append(f"Pillow 库未安装或加载异常: {e}")
 
+    if errors:
+        return "；".join(errors)
+    return None
 
 class CompressApp:
     def __init__(self, root, bk):
+        """
+        Sigil 插件主控应用实例。
+        【线程安全规范】：Sigil 的 bk 对象是非线程安全的，所有涉及 bk 的读写必须全部在主 GUI 线程中运行。
+        """
         self.root = root
         self.bk = bk
-        self.images = []  # To store metadata of images extracted from the ebook
+        self.images = []  # 存放从电子书提取的图片元数据
+        self.error_details = []  # 记录处理过程中发生的具体错误
+        self._ui_disabled = False  # 处理中的 UI 锁定保护标志
+        self._is_cancelled = False  # 生命周期与线程安全退出标志
+        self.temp_dir = None  # 磁盘临时缓存目录句柄
+        self.executor = None
         
-        # 读取用户之前的设置
+        self._check_queue_job = None
+        self._scroll_job = None
+        self._resize_job = None
+        
+        # 内存索引缓存，避免频繁遍历 manifest
+        self._existing_ids = set()
+        self._existing_basenames = set()
+        
         self.prefs = self.load_prefs()
         
-        # Configure overall style and layout
-        self.root.title("CompressImg-Pro V1.1")
-        self.root.geometry("1050x800")
-        self.root.minsize(1000, 750)
+        self.root.title("CompressImg-Pro V1.2")
+        self.root.geometry("1100x800")
+        self.root.minsize(1050, 750)
         self.root.eval('tk::PlaceWindow . center')
         
         self.style = ttk.Style()
-        # Use 'clam' theme for a flatter, more modern cross-platform look
         if 'clam' in self.style.theme_names():
             self.style.theme_use('clam')
             
         self.os_font = "微软雅黑" if sys.platform == "win32" else "Helvetica Neue"
         
-        # Modern Color Palette
         bg_color = "#f4f6f9"
+        self.bg_color = bg_color
         fg_color = "#2c3e50"
         accent_color = "#3498db"
         accent_active = "#2980b9"
         
+        self.panel_states = self.prefs.get('panel_states', {})
         self.root.configure(background=bg_color)
-        
-        # Configure standard widgets
+
         self.style.configure(".", font=(self.os_font, 10), background=bg_color, foreground=fg_color)
-        
-        # 移除单选框和复选框点击时的焦点虚线框
         self.style.configure("TCheckbutton", focuscolor=bg_color)
         self.style.configure("TRadiobutton", focuscolor=bg_color)
         
-        # 使【无损转换】【质量压缩】等在禁用(灰底)状态下仍保持深色字体
         self.style.map("TRadiobutton", foreground=[('disabled', fg_color)])
         self.style.map("TCheckbutton", foreground=[('disabled', fg_color)])
         
-        # 强制所有下拉框和调节框为白底，并且正在调节的框变为强调色(蓝色)，消除默认的灰底文本选中色
         self.style.map('TCombobox', 
                        fieldbackground=[('focus', accent_color), ('readonly', 'white'), ('disabled', 'white'), ('!disabled', 'white')],
                        selectbackground=[('focus', accent_color), ('!focus', 'white')],
@@ -126,134 +354,190 @@ class CompressApp:
                        foreground=[('focus', 'white')])
         
         self.style.configure("TFrame", background=bg_color)
-        
-        # Configure Labelframes
         self.style.configure("TLabelframe", background=bg_color, borderwidth=1, bordercolor="#dcdde1")
         self.style.configure("TLabelframe.Label", font=(self.os_font, 11, "bold"), foreground="#34495e", background=bg_color)
         
-        # Configure Buttons
         self.style.configure("TButton", font=(self.os_font, 10), padding=6, relief="flat", background="#e0e6ed", foreground=fg_color)
         self.style.map("TButton", background=[('active', '#d1d8e0')])
         
-        # Accent Button (Primary Action)
         self.style.configure("Accent.TButton", font=(self.os_font, 10, "bold"), padding=6, relief="flat", background=accent_color, foreground="white")
         self.style.map("Accent.TButton", 
                        background=[('active', accent_active), ('disabled', '#e0e6ed')],
                        foreground=[('disabled', '#95a5a6')])
                        
-        # Processing Button (Darker shade for running state)
-        processing_color = "#154360" # 颜色比悬停更深
+        processing_color = "#154360"
         self.style.configure("Processing.TButton", font=(self.os_font, 10, "bold"), padding=6, relief="flat", background=processing_color, foreground="white")
         self.style.map("Processing.TButton", 
                        background=[('disabled', processing_color)], 
                        foreground=[('disabled', 'white')])
                        
-        # Error Button (Red for validation failure)
         error_color = "#e74c3c"
         self.style.configure("Error.TButton", font=(self.os_font, 10, "bold"), padding=6, relief="flat", background=error_color, foreground="white")
         self.style.map("Error.TButton", 
                        background=[('disabled', error_color)], 
                        foreground=[('disabled', 'white')])
         
-        # Configure Treeview (Data Table)
         self.style.configure("Treeview", rowheight=30, borderwidth=0, fieldbackground="#ffffff", font=(self.os_font, 10))
         self.style.configure("Treeview.Heading", font=(self.os_font, 10, "bold"), background="#e0e6ed", foreground=fg_color, relief="flat", padding=5)
         self.style.map('Treeview', background=[('selected', accent_color)], foreground=[('selected', 'white')])
         
         self.init_data()
         self.build_ui()
+        atexit.register(self._cleanup_temp_dir)
+
+    def close_app(self):
+        """[优化 7] 窗口关闭安全清理函数：标记取消标识并彻底杀死后台任务"""
+        self._is_cancelled = True
+        try:
+            atexit.unregister(self._cleanup_temp_dir)
+        except Exception:
+            pass
+        
+        for job_attr in ('_check_queue_job', '_scroll_job', '_resize_job'):
+            job_id = getattr(self, job_attr, None)
+            if job_id and hasattr(self, 'root') and self.root:
+                try:
+                    self.root.after_cancel(job_id)
+                except Exception:
+                    pass
+                setattr(self, job_attr, None)
+
+        if hasattr(self, 'executor') and self.executor:
+            try:
+                # 兼容 Python 3.9+ cancel_futures 参数
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self.executor.shutdown(wait=False)
+            except Exception:
+                pass
+        
+        self._cleanup_temp_dir()
+        self.save_prefs()
+        
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def load_prefs(self):
-        """从用户目录加载历史配置"""
-        path = os.path.join(os.path.expanduser("~"), ".sigil_compress_plugin_prefs.json")
+        """从插件目录加载历史配置"""
+        path = os.path.join(str(_PLUGIN_DIR), ".sigil_compress_plugin_prefs.json")
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 pass
         return {}
 
     def save_prefs(self):
-        """保存当前配置到用户目录"""
-        path = os.path.join(os.path.expanduser("~"), ".sigil_compress_plugin_prefs.json")
+        """保存当前配置到插件目录"""
+        path = os.path.join(str(_PLUGIN_DIR), ".sigil_compress_plugin_prefs.json")
+        
+        def _to_int(val, default):
+            try:
+                if isinstance(val, str):
+                    val = val.replace("级", "").strip()
+                return int(val)
+            except Exception:
+                return default
+
         prefs = {
             'format_conv': self.var_format_conv.get(),
             'combo_conv': self.combo_conv.get(),
             'conv_type': self.var_conv_type.get(),
-            'conv_lossless_lvl': self.combo_conv_lossless_level.get(),
-            'conv_qlty': self.sp_conv_qlty.get(),
+            'conv_lossless_lvl': f"{_to_int(self.combo_conv_lossless_level.get(), 2)}级",
+            'conv_qlty': _to_int(self.sp_conv_qlty.get(), 80),
             'qlty_cmp': self.var_qlty_cmp.get(),
-            'jpeg_qlty': self.sp_jpeg_qlty.get(),
-            'webp_qlty': self.sp_webp_qlty.get(),
-            'depth_cmp': self.var_colordepth_cmp.get(),
+            'jpeg_qlty': _to_int(self.sp_jpeg_qlty.get(), 80),
+            'webp_qlty': _to_int(self.sp_webp_qlty.get(), 80),
+            'scale_img': self.var_scale_img.get(),
+            'scale_type': self.var_scale_type.get(),
+            'scale_percent': _to_int(self.sp_scale_percent.get(), 50),
+            'scale_width': _to_int(self.sp_scale_width.get(), 800),
+            'scale_height': _to_int(self.sp_scale_height.get(), 800),
+            'depth_cmp': self.var_colordepth_cmp.get() if HAS_IMAGEQUANT else False,
             'lossless_cmp': self.var_lossless_cmp.get(),
-            'lossless_lvl': self.combo_adv_lossless.get(),
+            'lossless_lvl': f"{_to_int(self.combo_adv_lossless.get(), 2)}级",
+            'strip_meta': self.var_strip_meta.get(),
+            'batch_rename': self.var_batch_rename.get(),
+            'panel_states': getattr(self, 'panel_states', {})
         }
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(prefs, f)
-        except:
-            pass
+        except Exception as e:
+            print(f"保存配置失败: {e}")
 
     def init_data(self):
-        """Iterate through all images in the Sigil ebook and collect their metadata."""
+        """遍历并读取 Sigil 电子书中所有图片的元数据（主线程上执行）"""
         if self.bk is None:
-            # For testing mode without Sigil
             return
             
-        for img_info in self.bk.image_iter():
-            try:
-                img_id = img_info[0]
-                href = img_info[1]
-                
-                data = self.bk.readfile(img_id)
-                size = len(data)
-                filename = href.split('/')[-1]
-                ext = filename.split('.')[-1].upper()
-                
-                self.images.append({
-                    'id': img_id,
-                    'href': href,
-                    'filename': filename,
-                    'size': size,
-                    'format': ext,
-                    'selected': False,  # 默认全不选
-                    'rotate': 0        # Default rotation angle
-                })
-            except Exception as e:
-                print(f"读取图片 {href} 失败: {e}")
+        self.images.clear()
+        try:
+            for img_info in self.bk.image_iter():
+                try:
+                    img_id = img_info[0]
+                    href = posixpath.normpath(img_info[1])
+                    
+                    data = self.bk.readfile(img_id)
+                    size = len(data) if data else 0
+                    filename = href.split('/')[-1]
+                    ext = filename.rsplit('.', 1)[-1].upper() if '.' in filename else 'UNKNOWN'
+                    
+                    w, h = 0, 0
+                    if data:
+                        try:
+                            with Image.open(BytesIO(data)) as tmp_img:
+                                tmp_img = ImageOps.exif_transpose(tmp_img)
+                                w, h = tmp_img.size
+                        except Exception:
+                            pass
+                    
+                    self.images.append({
+                        'id': img_id,
+                        'href': href,
+                        'filename': filename,
+                        'size': size,
+                        'format': ext,
+                        'width': w,
+                        'height': h,
+                        'selected': False,
+                        'rotate': 0
+                    })
+                except Exception as e:
+                    print(f"读取图片 {img_info} 失败: {e}")
+        except Exception as iter_err:
+            print(f"遍历电子书图片失败: {iter_err}")
 
     def build_ui(self):
-        """Constructs the main wrappers and left/right panels."""
-        # Main wrapper to hold the content
+        """构建 UI 视图结构"""
+        self._managed_widgets = []
+        
         self.main_wrapper = ttk.Frame(self.root)
         self.main_wrapper.pack(fill=tk.BOTH, expand=True)
         
-        # Main split pane
-        self.main_pane = ttk.PanedWindow(self.main_wrapper, orient=tk.HORIZONTAL)
-        self.main_pane.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        self.main_wrapper.columnconfigure(0, weight=1)
+        self.main_wrapper.columnconfigure(1, weight=0)
+        self.main_wrapper.rowconfigure(0, weight=1)
         
-        self.left_frame = ttk.Frame(self.main_pane)
-        self.right_frame = ttk.Frame(self.main_pane)
+        self.left_frame = ttk.Frame(self.main_wrapper)
+        self.right_frame = ttk.Frame(self.main_wrapper)
         
-        # 严格分配 80% 和 20% 空间 (4:1)
-        self.main_pane.add(self.left_frame, weight=4)
-        self.main_pane.add(self.right_frame, weight=1)
+        self.left_frame.grid(row=0, column=0, sticky='nsew', padx=(15, 7.5), pady=15)
+        self.right_frame.grid(row=0, column=1, sticky='nsew', padx=(7.5, 15), pady=15)
         
-        # Build panels
         self.build_left_panel(self.left_frame)
         self.build_right_panel(self.right_frame)
         
         self.update_states()
         
-        # 绑定快捷键
         self.root.bind('<Control-a>', lambda e: self.select_all())
         self.root.bind('<Control-A>', lambda e: self.select_all())
         self.root.bind('<Return>', lambda e: self.run_process())
 
     def build_left_panel(self, parent):
-        # 1. 快速筛选面板
         filter_frame = ttk.LabelFrame(parent, text=" 快速筛选 ")
         filter_frame.pack(fill=tk.X, side=tk.TOP, pady=5)
         
@@ -265,15 +549,22 @@ class CompressApp:
         self.var_png = tk.BooleanVar(value=True)
         self.var_webp = tk.BooleanVar(value=True)
         
-        ttk.Checkbutton(inner_filter, text="BMP", variable=self.var_bmp, command=self.apply_filter).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(inner_filter, text="JPEG", variable=self.var_jpg, command=self.apply_filter).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(inner_filter, text="PNG", variable=self.var_png, command=self.apply_filter).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(inner_filter, text="WEBP", variable=self.var_webp, command=self.apply_filter).pack(side=tk.LEFT, padx=5)
+        cb_bmp = ttk.Checkbutton(inner_filter, text="BMP", variable=self.var_bmp, command=self.apply_filter)
+        cb_bmp.pack(side=tk.LEFT, padx=5)
+        cb_jpg = ttk.Checkbutton(inner_filter, text="JPEG", variable=self.var_jpg, command=self.apply_filter)
+        cb_jpg.pack(side=tk.LEFT, padx=5)
+        cb_png = ttk.Checkbutton(inner_filter, text="PNG", variable=self.var_png, command=self.apply_filter)
+        cb_png.pack(side=tk.LEFT, padx=5)
+        cb_webp = ttk.Checkbutton(inner_filter, text="WEBP", variable=self.var_webp, command=self.apply_filter)
+        cb_webp.pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(inner_filter, text="反 选", command=self.select_reverse, width=6).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(inner_filter, text="全 选", command=self.select_all, width=6).pack(side=tk.RIGHT, padx=5)
+        btn_rev = ttk.Button(inner_filter, text="反 选", command=self.select_reverse, width=6)
+        btn_rev.pack(side=tk.RIGHT, padx=5)
+        btn_all = ttk.Button(inner_filter, text="全 选", command=self.select_all, width=6)
+        btn_all.pack(side=tk.RIGHT, padx=5)
 
-        # 3. 旋转控制面板
+        self._managed_widgets.extend([cb_bmp, cb_jpg, cb_png, cb_webp, btn_rev, btn_all])
+
         ctrl_top = ttk.Frame(parent)
         ctrl_top.pack(fill=tk.X, side=tk.TOP, pady=5)
         
@@ -283,11 +574,15 @@ class CompressApp:
         inner_rot = ttk.Frame(rot_frame, padding=8)
         inner_rot.pack(fill=tk.X)
         
-        ttk.Button(inner_rot, text="↻ 顺时针 90°", command=lambda: self.rotate_selected(-90)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(inner_rot, text="↺ 逆时针 90°", command=lambda: self.rotate_selected(90)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(inner_rot, text="✖ 重置旋转", command=lambda: self.rotate_selected(0)).pack(side=tk.LEFT, padx=5)
+        btn_rot_cw = ttk.Button(inner_rot, text="↻ 顺时针 90°", command=lambda: self.rotate_selected(90))
+        btn_rot_cw.pack(side=tk.LEFT, padx=5)
+        btn_rot_ccw = ttk.Button(inner_rot, text="↺ 逆时针 90°", command=lambda: self.rotate_selected(-90))
+        btn_rot_ccw.pack(side=tk.LEFT, padx=5)
+        btn_rot_reset = ttk.Button(inner_rot, text="✖ 重置旋转", command=lambda: self.rotate_selected(0))
+        btn_rot_reset.pack(side=tk.LEFT, padx=5)
 
-        # 2. Treeview for image list
+        self._managed_widgets.extend([btn_rot_cw, btn_rot_ccw, btn_rot_reset])
+
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         
@@ -296,15 +591,30 @@ class CompressApp:
         
         self.tree = ttk.Treeview(tree_frame, columns=('Name', 'Format', 'Size', 'Rotate'), show='headings', selectmode="extended")
         self.tree.heading('Name', text='文件名称')
-        self.tree.column('Name', minwidth=150, width=265, stretch=tk.YES)
+        self.tree.column('Name', minwidth=150, anchor='w')
         self.tree.heading('Format', text='格式')
-        self.tree.column('Format', width=105, anchor='center', stretch=tk.NO)
+        self.tree.column('Format', minwidth=60, anchor='center')
         self.tree.heading('Size', text='体积')
-        self.tree.column('Size', width=105, anchor='e', stretch=tk.NO)
+        self.tree.column('Size', minwidth=60, anchor='e')
         self.tree.heading('Rotate', text='旋转状态')
-        self.tree.column('Rotate', width=105, anchor='center', stretch=tk.NO)
+        self.tree.column('Rotate', minwidth=60, anchor='center')
         
-        # Tags for zebra striping
+        def _on_tree_resize(event):
+            w = event.width
+            if getattr(self.tree, '_last_width', None) != w and w > 100:
+                self.tree._last_width = w
+                name_w = int(w * 0.50)
+                rem = w - name_w
+                col_w = int(rem / 3)
+                rot_w = rem - (col_w * 2)
+                
+                self.tree.column('Name', width=name_w)
+                self.tree.column('Format', width=col_w)
+                self.tree.column('Size', width=col_w)
+                self.tree.column('Rotate', width=rot_w)
+                
+        self.tree.bind('<Configure>', _on_tree_resize)
+        
         self.tree.tag_configure('even', background='#fafbfc')
         self.tree.tag_configure('odd', background='#ffffff')
         
@@ -314,114 +624,329 @@ class CompressApp:
         self.tree.grid(row=0, column=0, sticky='nsew')
         yscrollbar.grid(row=0, column=1, sticky='ns')
         
-        # 绑定原生选择事件，替代原本拦截鼠标左键的逻辑，从而支持 Shift/Ctrl 多选
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
+        self.tree.bind('<Double-1>', self.on_tree_double_click)
         
         self.refresh_tree()
 
+    def _create_collapsible(self, parent, title, key):
+        """卡片收纳折叠容器"""
+        card = ttk.Frame(parent)
+        card.pack(fill=tk.X, padx=5, pady=4)
+        
+        header = ttk.Frame(card, cursor="hand2")
+        header.pack(fill=tk.X, expand=True)
+        
+        is_open = self.panel_states.get(key, True)
+        self.panel_states[key] = is_open
+        
+        lbl_icon = tk.Label(
+            header, 
+            text="▼" if is_open else "▶", 
+            font=(self.os_font, 9, "bold"), 
+            foreground="#34495e", 
+            background=self.bg_color, 
+            cursor="hand2", 
+            width=2
+        )
+        lbl_icon.pack(side=tk.LEFT, padx=(2, 0))
+        
+        lbl_title = tk.Label(
+            header, 
+            text=f" {title}", 
+            font=(self.os_font, 10, "bold"), 
+            foreground="#34495e", 
+            background=self.bg_color, 
+            cursor="hand2",
+                 anchor='w'
+        )
+        lbl_title.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=4)
+        
+        inner = ttk.Frame(card, padding=(10, 5, 10, 5))
+        
+        def toggle(event=None):
+            if getattr(self, '_ui_disabled', False):
+                return
+            self.panel_states[key] = not self.panel_states[key]
+            if self.panel_states[key]:
+                inner.pack(fill=tk.X, expand=True, pady=(2, 5))
+                lbl_icon.config(text="▼")
+            else:
+                inner.pack_forget()
+                lbl_icon.config(text="▶")
+                
+        header.bind("<Button-1>", toggle)
+        lbl_icon.bind("<Button-1>", toggle)
+        lbl_title.bind("<Button-1>", toggle)
+        
+        if is_open:
+            inner.pack(fill=tk.X, expand=True, pady=(2, 5))
+        else:
+            inner.pack_forget()
+            
+        return inner
+
     def build_right_panel(self, parent):
-        padding_opts = {'fill': tk.X, 'padx': 5, 'pady': 5}
+        """构建右侧设置选项"""
+        self.action_frame = ttk.Frame(parent)
+        self.action_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
         
-        # 1. 格式转化 (Format Conversion)
+        self.btn_run = ttk.Button(self.action_frame, text="🚀 执 行 处 理", command=self.run_process, style="Accent.TButton")
+        self.btn_run.pack(fill=tk.X, expand=True, ipady=8)
+
+        scroll_container = ttk.Frame(parent)
+        scroll_container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        canvas = tk.Canvas(scroll_container, bg=self.bg_color, highlightthickness=0, borderwidth=0, width=340)
+        
+        options_frame = ttk.Frame(canvas)
+        options_frame.columnconfigure(0, weight=1)
+        canvas_window = canvas.create_window((0, 0), window=options_frame, anchor="nw")
+        
+        def _update_scroll_region():
+            if canvas.winfo_exists():
+                bbox = canvas.bbox("all")
+                canvas.configure(scrollregion=bbox)
+                if bbox:
+                    content_height = bbox[3] - bbox[1]
+                    canvas_height = canvas.winfo_height()
+                    if content_height <= canvas_height:
+                        canvas.yview_moveto(0)
+
+        def _on_frame_configure(event):
+            if self._scroll_job and self.root:
+                try:
+                    self.root.after_cancel(self._scroll_job)
+                except Exception:
+                    pass
+            if not getattr(self, '_is_cancelled', False):
+                self._scroll_job = self.root.after(15, _update_scroll_region)
+            
+        def _update_canvas_width(w):
+            if canvas.winfo_exists():
+                canvas.itemconfig(canvas_window, width=w)
+
+        def _on_canvas_configure(event):
+            w = event.width
+            if getattr(canvas, '_last_width', None) != w:
+                canvas._last_width = w
+                if self._resize_job and self.root:
+                    try:
+                        self.root.after_cancel(self._resize_job)
+                    except Exception:
+                        pass
+                if not getattr(self, '_is_cancelled', False):
+                    self._resize_job = self.root.after(15, lambda: _update_canvas_width(w))
+            _update_scroll_region()
+                
+        options_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        
+        def _on_mousewheel(event):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            content_height = bbox[3] - bbox[1]
+            canvas_height = canvas.winfo_height()
+            
+            if content_height <= canvas_height:
+                canvas.yview_moveto(0)
+                return
+                
+            if event.delta:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+                
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        # 1. 格式转化
         self.var_format_conv = tk.BooleanVar(value=self.prefs.get('format_conv', False))
-        lf_conv = ttk.LabelFrame(parent, text=" 格式转化 ")
-        lf_conv.pack(**padding_opts)
+        inner_conv = self._create_collapsible(options_frame, "格式转化", "panel_conv")
+        inner_conv.columnconfigure(0, weight=1)
+        inner_conv.columnconfigure(1, weight=0)
         
-        inner_conv = ttk.Frame(lf_conv, padding=10)
-        inner_conv.pack(fill=tk.BOTH, expand=True)
-        
-        ttk.Checkbutton(inner_conv, text="启用格式转化", variable=self.var_format_conv, command=lambda: self.on_mode_change('format')).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        chk_format_conv = ttk.Checkbutton(inner_conv, text="启用格式转化", variable=self.var_format_conv, command=lambda: self.on_mode_change('format'))
+        chk_format_conv.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         
         ttk.Label(inner_conv, text="目标图片格式:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.combo_conv = ttk.Combobox(inner_conv, values=["JPEG", "PNG", "WEBP"], state="readonly", width=12)
+        self.combo_conv = ttk.Combobox(inner_conv, values=["JPEG", "PNG", "WEBP"], state="readonly", width=10)
         self.combo_conv.set(self.prefs.get('combo_conv', 'JPEG'))
-        self.combo_conv.grid(row=1, column=1, sticky=tk.W, pady=5, padx=10)
+        self.combo_conv.grid(row=1, column=1, sticky=tk.E, pady=5, padx=(5, 0))
         self.combo_conv.bind('<<ComboboxSelected>>', lambda e: self.update_states())
         
         self.var_conv_type = tk.StringVar(value=self.prefs.get('conv_type', 'quality'))
         self.rb_conv_lossless = ttk.Radiobutton(inner_conv, text="无损转换", variable=self.var_conv_type, value="lossless", command=self.update_states)
         self.rb_conv_lossless.grid(row=2, column=0, sticky=tk.W, pady=5)
         
-        self.combo_conv_lossless_level = ttk.Combobox(inner_conv, values=[f"{i}级" for i in range(10)], state="readonly", width=12)
+        self.combo_conv_lossless_level = ttk.Combobox(inner_conv, values=[f"{i}级" for i in range(10)], state="readonly", width=10)
         self.combo_conv_lossless_level.set(self.prefs.get('conv_lossless_lvl', '2级'))
-        self.combo_conv_lossless_level.grid(row=2, column=1, sticky=tk.W, pady=5, padx=10)
+        self.combo_conv_lossless_level.grid(row=2, column=1, sticky=tk.E, pady=5, padx=(5, 0))
         
         self.rb_conv_qlty = ttk.Radiobutton(inner_conv, text="质量压缩", variable=self.var_conv_type, value="quality", command=self.update_states)
         self.rb_conv_qlty.grid(row=3, column=0, sticky=tk.W, pady=5)
         
-        self.sp_conv_qlty = ttk.Spinbox(inner_conv, from_=5, to=100, width=12)
+        self.sp_conv_qlty = ttk.Spinbox(inner_conv, from_=5, to=100, width=10)
         self.sp_conv_qlty.set(self.prefs.get('conv_qlty', 80))
-        self.sp_conv_qlty.grid(row=3, column=1, sticky=tk.W, pady=5, padx=10)
+        self.sp_conv_qlty.grid(row=3, column=1, sticky=tk.E, pady=5, padx=(5, 0))
 
-        # 2. 质量压缩 (Quality Compression)
+        # 2. 质量压缩与尺寸缩放
         self.var_qlty_cmp = tk.BooleanVar(value=self.prefs.get('qlty_cmp', False))
-        lf_qlty = ttk.LabelFrame(parent, text=" 质量压缩 (限 JPEG、WEBP) ")
-        lf_qlty.pack(**padding_opts)
+        inner_qlty = self._create_collapsible(options_frame, "质量压缩与缩放", "panel_qlty")
+        inner_qlty.columnconfigure(0, weight=1)
+        inner_qlty.columnconfigure(1, weight=0)
         
-        inner_qlty = ttk.Frame(lf_qlty, padding=10)
-        inner_qlty.pack(fill=tk.BOTH, expand=True)
-        
-        ttk.Checkbutton(inner_qlty, text="启用质量压缩", variable=self.var_qlty_cmp, command=lambda: self.on_mode_change('quality')).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        chk_qlty_cmp = ttk.Checkbutton(inner_qlty, text="启用质量压缩", variable=self.var_qlty_cmp, command=lambda: self.on_mode_change('quality'))
+        chk_qlty_cmp.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         
         ttk.Label(inner_qlty, text="JPEG 输出质量:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.sp_jpeg_qlty = ttk.Spinbox(inner_qlty, from_=5, to=95, width=12)
+        self.sp_jpeg_qlty = ttk.Spinbox(inner_qlty, from_=5, to=95, width=10)
         self.sp_jpeg_qlty.set(self.prefs.get('jpeg_qlty', 80))
-        self.sp_jpeg_qlty.grid(row=1, column=1, sticky=tk.W, pady=5, padx=10)
+        self.sp_jpeg_qlty.grid(row=1, column=1, sticky=tk.E, pady=5, padx=(5, 0))
         
         ttk.Label(inner_qlty, text="WEBP 输出质量:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.sp_webp_qlty = ttk.Spinbox(inner_qlty, from_=5, to=100, width=12)
+        self.sp_webp_qlty = ttk.Spinbox(inner_qlty, from_=5, to=100, width=10)
         self.sp_webp_qlty.set(self.prefs.get('webp_qlty', 80))
-        self.sp_webp_qlty.grid(row=2, column=1, sticky=tk.W, pady=5, padx=10)
+        self.sp_webp_qlty.grid(row=2, column=1, sticky=tk.E, pady=5, padx=(5, 0))
+        
+        self.var_scale_img = tk.BooleanVar(value=self.prefs.get('scale_img', False))
+        chk_scale_img = ttk.Checkbutton(inner_qlty, text="启用图片缩放", variable=self.var_scale_img, command=lambda: self.on_mode_change('quality'))
+        chk_scale_img.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(5, 5))
+        
+        self.var_scale_type = tk.StringVar(value=self.prefs.get('scale_type', 'percent'))
+        
+        self.rb_scale_percent = ttk.Radiobutton(inner_qlty, text="按百分比缩放", variable=self.var_scale_type, value="percent", command=self.update_states)
+        self.rb_scale_percent.grid(row=4, column=0, sticky=tk.W, pady=5)
+        
+        self.sp_scale_percent = ttk.Spinbox(inner_qlty, from_=1, to=500, width=10)
+        self.sp_scale_percent.set(self.prefs.get('scale_percent', 50))
+        self.sp_scale_percent.grid(row=4, column=1, sticky=tk.E, pady=5, padx=(5, 0))
+        
+        self.rb_scale_width = ttk.Radiobutton(inner_qlty, text="按指定宽度缩放", variable=self.var_scale_type, value="width", command=self.update_states)
+        self.rb_scale_width.grid(row=5, column=0, sticky=tk.W, pady=5)
+        
+        self.sp_scale_width = ttk.Spinbox(inner_qlty, from_=1, to=10000, width=10)
+        self.sp_scale_width.set(self.prefs.get('scale_width', 800))
+        self.sp_scale_width.grid(row=5, column=1, sticky=tk.E, pady=5, padx=(5, 0))
+        
+        self.rb_scale_height = ttk.Radiobutton(inner_qlty, text="按指定高度缩放", variable=self.var_scale_type, value="height", command=self.update_states)
+        self.rb_scale_height.grid(row=6, column=0, sticky=tk.W, pady=5)
+        
+        self.sp_scale_height = ttk.Spinbox(inner_qlty, from_=1, to=10000, width=10)
+        self.sp_scale_height.set(self.prefs.get('scale_height', 800))
+        self.sp_scale_height.grid(row=6, column=1, sticky=tk.E, pady=5, padx=(5, 0))
 
-        # 3. 位深与无损压缩
-        lf_adv = ttk.LabelFrame(parent, text=" 高级压缩 ")
-        lf_adv.pack(**padding_opts)
+        # 3. 位深与高级无损压缩
+        inner_adv = self._create_collapsible(options_frame, "高级压缩", "panel_adv")
+        inner_adv.columnconfigure(0, weight=1)
+        inner_adv.columnconfigure(1, weight=0)
         
-        inner_adv = ttk.Frame(lf_adv, padding=10)
-        inner_adv.pack(fill=tk.BOTH, expand=True)
+        initial_depth_val = self.prefs.get('depth_cmp', False) if HAS_IMAGEQUANT else False
+        self.var_colordepth_cmp = tk.BooleanVar(value=initial_depth_val)
         
-        self.var_colordepth_cmp = tk.BooleanVar(value=self.prefs.get('depth_cmp', False))
-        ttk.Checkbutton(inner_adv, text="启用位深压缩 (PNG转8位)", variable=self.var_colordepth_cmp, command=lambda: self.on_mode_change('advanced')).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        self.chk_depth_cmp = ttk.Checkbutton(
+            inner_adv, 
+            text="启用位深压缩 (PNG转8位)", 
+            variable=self.var_colordepth_cmp, 
+            command=lambda: self.on_mode_change('advanced')
+        )
+        self.chk_depth_cmp.grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        
+        if not HAS_IMAGEQUANT:
+            strike_font = tkfont.Font(family=self.os_font, size=10, overstrike=1)
+            self.style.configure("Strikethrough.TCheckbutton", font=strike_font)
+            self.style.map("Strikethrough.TCheckbutton", 
+                           font=[('disabled', strike_font), ('!disabled', strike_font)],
+                           foreground=[('disabled', '#888888'), ('!disabled', '#888888')])
+            self.chk_depth_cmp.config(style="Strikethrough.TCheckbutton", state=tk.DISABLED)
+            self.var_colordepth_cmp.set(False)
         
         self.var_lossless_cmp = tk.BooleanVar(value=self.prefs.get('lossless_cmp', False))
-        ttk.Checkbutton(inner_adv, text="启用无损压缩", variable=self.var_lossless_cmp, command=lambda: self.on_mode_change('advanced')).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        chk_lossless_cmp = ttk.Checkbutton(inner_adv, text="启用无损压缩(JPEG高质量)", variable=self.var_lossless_cmp, command=lambda: self.on_mode_change('advanced'))
+        chk_lossless_cmp.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         
         ttk.Label(inner_adv, text="无损压缩级别:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.combo_adv_lossless = ttk.Combobox(inner_adv, values=[f"{i}级" for i in range(10)], state="readonly", width=12)
+        self.combo_adv_lossless = ttk.Combobox(inner_adv, values=[f"{i}级" for i in range(10)], state="readonly", width=10)
         self.combo_adv_lossless.set(self.prefs.get('lossless_lvl', '2级'))
-        self.combo_adv_lossless.grid(row=2, column=1, sticky=tk.W, padx=10)
+        self.combo_adv_lossless.grid(row=2, column=1, sticky=tk.E, padx=(5, 0))
 
-        # Spacer 占位符
-        spacer = ttk.Frame(parent)
-        spacer.pack(fill=tk.BOTH, expand=True)
-
-        # 底部执行按钮容器
-        self.action_frame = ttk.Frame(parent)
-        self.action_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 0))
+        # 4. 元数据清理与批量重命名
+        inner_meta = self._create_collapsible(options_frame, "隐私与清理", "panel_meta")
+        inner_meta.columnconfigure(0, weight=1)
         
-        self.btn_run = ttk.Button(self.action_frame, text="🚀 执 行 处 理", command=self.run_process, style="Accent.TButton")
-        # 加大内边距使主按钮更显眼
-        self.btn_run.pack(fill=tk.X, expand=True, ipady=8)
+        self.var_strip_meta = tk.BooleanVar(value=self.prefs.get('strip_meta', False))
+        chk_strip_meta = ttk.Checkbutton(inner_meta, text="清除图片元数据 (EXIF等)", variable=self.var_strip_meta, command=self.check_run_state)
+        chk_strip_meta.grid(row=0, column=0, sticky=tk.W)
+
+        self.var_batch_rename = tk.BooleanVar(value=self.prefs.get('batch_rename', False))
+        chk_batch_rename = ttk.Checkbutton(inner_meta, text="按HTML调用顺序批量重命名", variable=self.var_batch_rename, command=self.check_run_state)
+        chk_batch_rename.grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+
+        self._managed_widgets.extend([
+            chk_format_conv, self.combo_conv, self.rb_conv_lossless, self.combo_conv_lossless_level,
+            self.rb_conv_qlty, self.sp_conv_qlty, chk_qlty_cmp, self.sp_jpeg_qlty, self.sp_webp_qlty,
+            chk_scale_img, self.rb_scale_percent, self.sp_scale_percent, self.rb_scale_width, self.sp_scale_width,
+            self.rb_scale_height, self.sp_scale_height, self.chk_depth_cmp, chk_lossless_cmp, self.combo_adv_lossless,
+            chk_strip_meta, chk_batch_rename
+        ])
+
+    def _set_ui_enabled(self, enabled=True):
+        """处理过程中精准锁定/解锁 UI 控件"""
+        self._ui_disabled = not enabled
+        tk_state = tk.NORMAL if enabled else tk.DISABLED
+        
+        for widget in getattr(self, '_managed_widgets', []):
+            try:
+                if widget == getattr(self, 'chk_depth_cmp', None) and not HAS_IMAGEQUANT:
+                    widget.config(state=tk.DISABLED)
+                    continue
+                if isinstance(widget, ttk.Combobox):
+                    widget.config(state="readonly" if enabled else "disabled")
+                elif isinstance(widget, ttk.Spinbox):
+                    widget.config(state="normal" if enabled else "disabled")
+                elif hasattr(widget, 'config'):
+                    widget.config(state=tk_state)
+            except Exception:
+                pass
+                
+        if not enabled:
+            self.btn_run.config(state=tk.DISABLED)
+        else:
+            self.check_run_state()
 
     def on_mode_change(self, active_mode):
-        """处理三大压缩类别的互斥逻辑，选取一项时自动取消另外两项的选择状态"""
+        """处理三大压缩类别的互斥逻辑"""
+        if getattr(self, '_ui_disabled', False):
+            return
+            
         if active_mode == 'format' and self.var_format_conv.get():
             self.var_qlty_cmp.set(False)
+            self.var_scale_img.set(False)
             self.var_colordepth_cmp.set(False)
             self.var_lossless_cmp.set(False)
-        elif active_mode == 'quality' and self.var_qlty_cmp.get():
+        elif active_mode == 'quality' and (self.var_qlty_cmp.get() or self.var_scale_img.get()):
             self.var_format_conv.set(False)
             self.var_colordepth_cmp.set(False)
             self.var_lossless_cmp.set(False)
         elif active_mode == 'advanced':
+            if not HAS_IMAGEQUANT:
+                self.var_colordepth_cmp.set(False)
             if self.var_colordepth_cmp.get() or self.var_lossless_cmp.get():
                 self.var_format_conv.set(False)
                 self.var_qlty_cmp.set(False)
+                self.var_scale_img.set(False)
         self.update_states()
 
     def update_states(self):
-        """Enable or disable option widgets based on checkbox selections."""
-        # 1. Format Conversion Logic (仅处理单选框的互斥与锁定，不再锁定任何数值调节框)
+        """根据复选框状态动态开启或置灰功能控件"""
+        if getattr(self, '_ui_disabled', False):
+            return
+
         is_conv = self.var_format_conv.get()
         
         if is_conv:
@@ -441,30 +966,46 @@ class CompressApp:
             self.rb_conv_lossless.state(['disabled'])
             self.rb_conv_qlty.state(['disabled'])
             
+        if self.var_scale_img.get():
+            self.rb_scale_percent.state(['!disabled'])
+            self.rb_scale_width.state(['!disabled'])
+            self.rb_scale_height.state(['!disabled'])
+        else:
+            self.rb_scale_percent.state(['disabled'])
+            self.rb_scale_width.state(['disabled'])
+            self.rb_scale_height.state(['disabled'])
+
+        if not HAS_IMAGEQUANT:
+            self.var_colordepth_cmp.set(False)
+            if hasattr(self, 'chk_depth_cmp'):
+                self.chk_depth_cmp.config(state=tk.DISABLED)
+            
         self.check_run_state()
 
     def check_run_state(self):
-        """Enable or disable the Run button based on selections."""
-        if not hasattr(self, 'btn_run'):
+        """检查是否有图片被选中以及是否有生效配置项"""
+        if not hasattr(self, 'btn_run') or getattr(self, '_ui_disabled', False):
             return
             
         has_selected_imgs = any(img['selected'] for img in self.images)
         has_features = (
             self.var_format_conv.get() or
             self.var_qlty_cmp.get() or
-            self.var_colordepth_cmp.get() or
+            self.var_scale_img.get() or
+            (self.var_colordepth_cmp.get() if HAS_IMAGEQUANT else False) or
             self.var_lossless_cmp.get() or
+            self.var_strip_meta.get() or
+            self.var_batch_rename.get() or
             any(img['rotate'] != 0 for img in self.images if img['selected'])
         )
         
-        # 必须同时有选中的图片和激活的功能，才能启用执行按钮
         if has_selected_imgs and has_features:
             self.btn_run.config(state=tk.NORMAL)
         else:
             self.btn_run.config(state=tk.DISABLED)
 
     def refresh_tree(self):
-        """Redraws the image list based on current data and filters."""
+        """重新绘制 Treeview 图片表格"""
         self._is_refreshing = True
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -482,19 +1023,21 @@ class CompressApp:
             
             size_str = f"{img['size']/1024:.1f} KB"
             
-            # Format rotation string nicely
-            rot = img['rotate']
-            if rot == 0: rot_str = ""
-            elif rot == -90: rot_str = "↻ 90°"
-            elif rot == 90: rot_str = "↺ 90°"
-            elif rot == 180: rot_str = "180°"
-            else: rot_str = f"{rot}°"
+            rot = img['rotate'] % 360
+            if rot == 0:
+                rot_str = ""
+            elif rot == 90:
+                rot_str = "↻ 90°"
+            elif rot == 180:
+                rot_str = "180°"
+            elif rot == 270:
+                rot_str = "↺ 90°"
+            else:
+                rot_str = f"↻ {rot}°"
             
             stripe_tag = 'even' if display_idx % 2 == 0 else 'odd'
-            # Tag holds the original index in self.images and the stripe styling
             item = self.tree.insert('', tk.END, values=(img['filename'], img['format'], size_str, rot_str), tags=(str(idx), stripe_tag))
             
-            # 恢复视觉选中状态
             if img['selected']:
                 self.tree.selection_add(item)
                 
@@ -502,28 +1045,37 @@ class CompressApp:
             
         self._is_refreshing = False
         self.check_run_state()
-            
+
     def on_tree_select(self, event):
-        """Syncs native Treeview selection (including Shift/Ctrl multi-select) back to the data model."""
-        if getattr(self, '_is_refreshing', False):
+        """同步 Treeview 选中项状态至数据模型"""
+        if getattr(self, '_is_refreshing', False) or getattr(self, '_ui_disabled', False):
             return
             
         selected_items = self.tree.selection()
-        # 仅同步当前可见项的选择状态，隐藏(被过滤)的项保持原状态不变
         for item in self.tree.get_children():
             idx = int(self.tree.item(item, 'tags')[0])
             self.images[idx]['selected'] = (item in selected_items)
             
+        selected_imgs = [img for img in self.images if img['selected']]
+        if len(selected_imgs) == 1:
+            w = selected_imgs[0].get('width', 0)
+            h = selected_imgs[0].get('height', 0)
+            if w and h:
+                if hasattr(self, 'sp_scale_width'): self.sp_scale_width.set(w)
+                if hasattr(self, 'sp_scale_height'): self.sp_scale_height.set(h)
+            
         self.check_run_state()
                     
     def select_all(self):
-        """选中当前列表中可见的所有项"""
+        if getattr(self, '_ui_disabled', False):
+            return
         for item in self.tree.get_children():
             self.tree.selection_add(item)
         self.on_tree_select(None)
         
     def select_reverse(self):
-        """反转当前列表中可见项的选中状态"""
+        if getattr(self, '_ui_disabled', False):
+            return
         selected = self.tree.selection()
         for item in self.tree.get_children():
             if item in selected:
@@ -533,10 +1085,13 @@ class CompressApp:
         self.on_tree_select(None)
         
     def apply_filter(self):
+        if getattr(self, '_ui_disabled', False):
+            return
         self.refresh_tree()
 
     def rotate_selected(self, angle):
-        """Adjust rotation for the currently highlighted Treeview items."""
+        if getattr(self, '_ui_disabled', False):
+            return
         for item in self.tree.selection():
             idx = int(self.tree.item(item, 'tags')[0])
             if angle == 0:
@@ -545,29 +1100,302 @@ class CompressApp:
                 self.images[idx]['rotate'] = (self.images[idx]['rotate'] + angle) % 360
         self.refresh_tree()
 
+    def on_tree_double_click(self, event):
+        if getattr(self, '_ui_disabled', False):
+            return
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        tags = self.tree.item(item, 'tags')
+        if tags:
+            idx = int(tags[0])
+            if 0 <= idx < len(self.images):
+                self.preview_image(self.images[idx])
+
+    def preview_image(self, img_info):
+        """双击弹窗预览选中的图片"""
+        if self.bk is None:
+            return
+            
+        try:
+            raw_data = self.bk.readfile(img_info['id'])
+            if not raw_data:
+                return
+            
+            with Image.open(BytesIO(raw_data)) as orig_img:
+                img = ImageOps.exif_transpose(orig_img)
+                img = convert_cmyk_to_rgb(img)
+                
+            if img_info.get('rotate', 0):
+                img = img.rotate(-img_info['rotate'], expand=True)
+                
+            orig_w, orig_h = img.size
+            size_kb = img_info['size'] / 1024.0
+            
+            win = tk.Toplevel(self.root)
+            win.title(f"图片预览 - {img_info['filename']}")
+            win.transient(self.root)
+            win.grab_set()
+            
+            max_w, max_h = 800, 600
+            scale = min(1.0, max_w / float(orig_w) if orig_w > 0 else 1.0, max_h / float(orig_h) if orig_h > 0 else 1.0)
+            preview_w = max(1, int(orig_w * scale))
+            preview_h = max(1, int(orig_h * scale))
+            
+            resample_filter = get_resample_filter(orig_w, orig_h, preview_w, preview_h)
+            disp_img = img.resize((preview_w, preview_h), resample_filter) if (preview_w, preview_h) != (orig_w, orig_h) else img
+            
+            photo = ImageTk.PhotoImage(disp_img)
+            
+            main_f = ttk.Frame(win, padding=15)
+            main_f.pack(fill=tk.BOTH, expand=True)
+            
+            img_lbl = ttk.Label(main_f, image=photo)
+            img_lbl.image = photo
+            img_lbl.pack(pady=(0, 10))
+            
+            info_str = f"文件名: {img_info['filename']}   |   分辨率: {orig_w} × {orig_h} px   |   体积: {size_kb:.1f} KB   |   格式: {img_info['format']}"
+            ttk.Label(main_f, text=info_str, font=(self.os_font, 9), foreground="#555555").pack(pady=(0, 12))
+            
+            ttk.Button(main_f, text="关 闭", command=win.destroy, width=10).pack()
+            
+            win.bind('<Escape>', lambda e: win.destroy())
+            
+            win.update_idletasks()
+            win_w = win.winfo_width()
+            win_h = win.winfo_height()
+            root_x = self.root.winfo_x()
+            root_y = self.root.winfo_y()
+            root_w = self.root.winfo_width()
+            root_h = self.root.winfo_height()
+            
+            center_x = root_x + (root_w - win_w) // 2
+            center_y = root_y + (root_h - win_h) // 2
+            win.geometry(f"+{center_x}+{center_y}")
+            
+        except Exception as e:
+            messagebox.showerror("预览失败", f"无法加载并预览图片: {e}", parent=self.root)
+
+    def _get_cover_hrefs_and_ids(self):
+        """
+        [优化 5] 精准识别电子书封面图片与封面 HTML。
+        仅依赖 EPUB 标准元数据与清单属性，排除宽泛的文件名前缀误判。
+        """
+        cover_hrefs = set()
+        cover_ids = set()
+        cover_html_hrefs = set()
+        cover_html_ids = set()
+        
+        if self.bk is None:
+            return cover_hrefs, cover_ids, cover_html_hrefs, cover_html_ids
+        
+        try:
+            meta_xml = self.bk.getmetadataxml()
+            if meta_xml:
+                matches = _RE_COVER_META_1.findall(meta_xml) + _RE_COVER_META_2.findall(meta_xml)
+                for cid in matches:
+                    cover_ids.add(cid)
+                    try:
+                        href = self.bk.id_to_href(cid)
+                        if href:
+                            cover_hrefs.add(posixpath.normpath(href))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+            
+        try:
+            for item in self.bk.manifest_iter():
+                item_id = item[0]
+                item_href = posixpath.normpath(item[1])
+                props = str(item[3]) if len(item) >= 4 and item[3] else ""
+                
+                if 'cover-image' in props:
+                    cover_ids.add(item_id)
+                    cover_hrefs.add(item_href)
+                if 'cover' in props and ('html' in item_href.lower() or 'xhtml' in item_href.lower()):
+                    cover_html_ids.add(item_id)
+                    cover_html_hrefs.add(item_href)
+                # 严格精确判定 ID，不再采用 filename.startswith('cover.') 误杀普通图片
+                if item_id.lower() in ('cover', 'cover-image', 'cover_image'):
+                    if any(item_href.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
+                        cover_ids.add(item_id)
+                        cover_hrefs.add(item_href)
+        except Exception:
+            pass
+                
+        return cover_hrefs, cover_ids, cover_html_hrefs, cover_html_ids
+
+    def _get_html_file_contents(self):
+        """主线程安全提取所有 HTML 与 SVG 文件内容（支持安全编码解析）"""
+        if self.bk is None:
+            return []
+
+        text_files = []
+        if hasattr(self.bk, 'spine_iter'):
+            try:
+                for item in self.bk.spine_iter():
+                    text_files.append((item[0], posixpath.normpath(item[1])))
+            except Exception:
+                pass
+        if not text_files:
+            if hasattr(self.bk, 'text_iter'):
+                try:
+                    for item in self.bk.text_iter():
+                        text_files.append((item[0], posixpath.normpath(item[1])))
+                except Exception:
+                    pass
+
+        if hasattr(self.bk, 'manifest_iter'):
+            try:
+                for item in self.bk.manifest_iter():
+                    item_id = item[0]
+                    item_href = posixpath.normpath(item[1])
+                    if item_href.lower().endswith('.svg') and (item_id, item_href) not in text_files:
+                        text_files.append((item_id, item_href))
+            except Exception:
+                pass
+
+        contents = []
+        for html_id, html_href in text_files:
+            try:
+                data = self.bk.readfile(html_id)
+                # [优化 4] 安全解码文本
+                text = safe_decode_text(data)
+                contents.append((html_id, html_href, text))
+            except Exception as e:
+                print(f"读取文本/SVG文件 {html_href} 内容失败: {e}")
+        return contents
+
+    def _compute_rename_stems(self, selected_imgs, cover_info, html_contents):
+        """后台计算重命名 Stem（纯内存计算）"""
+        cover_hrefs, cover_ids, cover_html_hrefs, cover_html_ids = cover_info
+        
+        href_to_imgid = {img['href']: img['id'] for img in self.images}
+        img_call_positions = {img['id']: [] for img in self.images}
+        call_counter = 0
+        
+        for html_id, html_href, html_text in html_contents:
+            if html_id in cover_html_ids or html_href in cover_html_hrefs:
+                continue
+                
+            try:
+                found_urls = []
+                for m in _RE_IMG_REF.finditer(html_text):
+                    url = m.group(1) or m.group(2)
+                    if url:
+                        found_urls.append(url)
+                        
+                for m in _RE_SRCSET.finditer(html_text):
+                    srcset_val = m.group(2) if m.group(1) else m.group(3)
+                    if srcset_val:
+                        for part in srcset_val.split(','):
+                            tokens = part.strip().split()
+                            if tokens:
+                                found_urls.append(tokens[0])
+                            
+                for raw_url in found_urls:
+                    book_path, _ = normalize_epub_path(html_href, raw_url)
+                    if not book_path:
+                        continue
+                        
+                    matched_img_id = href_to_imgid.get(book_path)
+                                
+                    if matched_img_id and matched_img_id in img_call_positions:
+                        if matched_img_id in cover_ids:
+                            continue
+                            
+                        call_counter += 1
+                        if call_counter not in img_call_positions[matched_img_id]:
+                            img_call_positions[matched_img_id].append(call_counter)
+
+            except Exception as e:
+                print(f"解析 HTML {html_href} 中的图片引用失败: {e}")
+                
+        digits = max(3, len(str(call_counter)))
+        fmt_str = f"p{{:0{digits}d}}"
+        
+        final_stems = {}
+        for img in selected_imgs:
+            img_id = img['id']
+            img_href = img['href']
+            
+            if img_id in cover_ids or img_href in cover_hrefs:
+                continue
+                
+            positions = img_call_positions.get(img_id, [])
+            if not positions:
+                continue
+                
+            if len(positions) > 3:
+                stem_parts = [fmt_str.format(pos) for pos in positions[:3]]
+                final_stems[img_id] = "_".join(stem_parts) + "__"
+            else:
+                stem_parts = [fmt_str.format(pos) for pos in positions]
+                final_stems[img_id] = "_".join(stem_parts)
+            
+        return final_stems
+
     def _fill_executor(self, opts):
-        """流式分块读取核心机制：保持活动任务数量不超过线程数的 2 倍，防止电子书过大撑爆内存"""
+        """流式并发调度任务"""
+        if self.bk is None or getattr(self, '_is_cancelled', False) or not hasattr(self, 'executor') or self.executor is None:
+            return
+            
         target_active = self.threads * 2
-        while len(self.active_futures) < target_active and self.process_queue:
+        while len(self.active_futures) < target_active and self.process_queue and not self._is_cancelled:
             img_info = self.process_queue.popleft()
             try:
-                # 必须在主线程触发宿主的 readfile（避免多线程调用 Sigil API 导致崩溃）
                 raw_data = self.bk.readfile(img_info['id'])
+                if raw_data is None:
+                    raise ValueError("读取得到空字节数据")
                 future = self.executor.submit(self.process_single_image, img_info, opts, raw_data)
                 self.active_futures[future] = img_info['id']
             except Exception as e:
-                print(f"读取图片失败 {img_info['id']}: {e}")
-                self.q.put((False, img_info['id'], str(e), None))
+                err_msg = f"读取图片 {img_info['filename']} 失败: {e}"
+                print(err_msg)
+                try:
+                    self.q.put_nowait((False, img_info['id'], err_msg, None))
+                except queue.Full:
+                    self.q.put((False, img_info['id'], err_msg, None))
+
+    def _write_binary_file(self, file_id, data):
+        """向 Sigil 书包 (bk) 安全写入二进制数据"""
+        if data is None:
+            return
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        if not isinstance(data, bytes):
+            raise TypeError(f"写入文件 {file_id} 需要 bytes 字节类型数据，当前为: {type(data)}")
+        self.bk.writefile(file_id, data)
+
+    def _cleanup_temp_dir(self):
+        """清理临时磁盘文件"""
+        if getattr(self, 'temp_dir', None) is not None:
+            try:
+                self.temp_dir.cleanup()
+            except Exception as e:
+                print(f"清理临时目录失败: {e}")
+            self.temp_dir = None
+
+    def _get_staged_data(self, item):
+        """获取暂存图片字节（优先从磁盘读取）"""
+        temp_path = item.get('temp_path')
+        if temp_path and os.path.exists(temp_path):
+            try:
+                with open(temp_path, 'rb') as f:
+                    return f.read()
+            except Exception as e:
+                print(f"读取临时文件 {temp_path} 失败: {e}")
+                return None
+        return item.get('data')
 
     def run_process(self):
-        """Prepares options and spawns background threads for image processing."""
-        # 如果按钮处于禁用状态（如通过回车快捷键触发时不满足条件），则直接返回
-        if str(self.btn_run['state']) == tk.DISABLED:
+        """准备参数并启动处理任务"""
+        if getattr(self, '_ui_disabled', False) or self.bk is None:
             return
             
-        # --- 数据校验 ---
-        invalid = False
-        
+        self._is_cancelled = False
+            
         def validate_sp(widget, min_v, max_v, default_v):
             try:
                 val = int(widget.get())
@@ -581,36 +1409,44 @@ class CompressApp:
         conv_qlty = validate_sp(self.sp_conv_qlty, 5, 100, 80)
         jpg_qlty = validate_sp(self.sp_jpeg_qlty, 5, 95, 80)
         webp_qlty = validate_sp(self.sp_webp_qlty, 5, 100, 80)
+        scale_percent = validate_sp(self.sp_scale_percent, 1, 500, 50)
+        scale_width = validate_sp(self.sp_scale_width, 1, 10000, 800)
+        scale_height = validate_sp(self.sp_scale_height, 1, 10000, 800)
         
-        # 提取高级压缩的无损级别下拉框的值
         try:
             adv_lossless_lvl = int(self.combo_adv_lossless.get().replace("级", ""))
         except ValueError:
             adv_lossless_lvl = 2
             
-        # 提取格式转换功能专属的无损级别下拉框的值
         try:
             conv_lossless_lvl = int(self.combo_conv_lossless_level.get().replace("级", ""))
         except ValueError:
             conv_lossless_lvl = 2
         
-        if None in (conv_qlty, jpg_qlty, webp_qlty):
-            # 校验失败，变红提示
+        if None in (conv_qlty, jpg_qlty, webp_qlty, scale_percent, scale_width, scale_height):
             self.btn_run.config(style="Error.TButton", state=tk.DISABLED, text="❌ 执 行 失 败")
-            self.root.after(1500, lambda: (
-                self.btn_run.config(style="Accent.TButton", text="🚀 执 行 处 理"),
-                self.check_run_state()
-            ))
+            if not getattr(self, '_is_cancelled', False):
+                self.root.after(1500, lambda: (
+                    self.btn_run.config(style="Accent.TButton", text="🚀 执 行 处 理"),
+                    self.check_run_state()
+                ))
             return
             
-        # 每次执行前保存配置
         self.save_prefs()
         
         selected_imgs = [img for img in self.images if img['selected']]
         if not selected_imgs:
             return
+
+        self._set_ui_enabled(False)
+        
+        self._cleanup_temp_dir()
+        try:
+            self.temp_dir = tempfile.TemporaryDirectory(prefix="sigil_compress_")
+        except Exception as e:
+            print(f"创建临时缓存目录失败: {e}")
+            self.temp_dir = None
             
-        # Collect configuration parameters
         opts = {
             'do_conv': self.var_format_conv.get(),
             'conv_target': self.combo_conv.get() if self.var_format_conv.get() else None,
@@ -622,398 +1458,765 @@ class CompressApp:
             'jpg_qlty': jpg_qlty,
             'webp_qlty': webp_qlty,
             
-            'do_depth': self.var_colordepth_cmp.get(),
+            'do_scale': self.var_scale_img.get(),
+            'scale_type': self.var_scale_type.get(),
+            'scale_percent': scale_percent,
+            'scale_width': scale_width,
+            'scale_height': scale_height,
+            
+            'do_depth': self.var_colordepth_cmp.get() if HAS_IMAGEQUANT else False,
             'do_lossless': self.var_lossless_cmp.get(),
-            'lossless_level': adv_lossless_lvl
+            'lossless_level': adv_lossless_lvl,
+            
+            'strip_meta': self.var_strip_meta.get(),
+            'batch_rename': self.var_batch_rename.get()
         }
         
-        # Update UI for processing state (更换状态和按钮颜色)
-        self.btn_run.config(style="Processing.TButton", state=tk.DISABLED, text="⚙ 正在处理...")
-        
-        self.success_count = 0
-        self.error_count = 0
-        self.processed_count = 0
-        self.rename_map = {}  # 记录格式转换时的旧文件名与新文件名映射
-        self.id_map = {}      # 记录格式转换时的旧ID与新ID映射 (用于 metadata 更新)
-        self.href_map = {}    # 记录旧 bookpath 与新 bookpath 映射
-        
-        # 缓存 EPUB 现有资源清单，用于新文件查重，绝对避免文件 ID 和文件名称冲突
-        self._existing_ids = {info[0] for info in self.bk.manifest_iter()}
-        self._existing_basenames = {info[1].split('/')[-1] for info in self.bk.manifest_iter()}
-        
-        # 配置多核并发 (提前初始化以便给 Queue 设置 maxsize)
-        self.threads = os.cpu_count() or 4
-        self.executor = ThreadPoolExecutor(max_workers=self.threads)
-        
-        # Communication queue & Thread pool
-        self.q = queue.Queue(maxsize=self.threads*4)
-        
-        self.process_queue = deque(selected_imgs)
-        self.active_futures = {}
-        
-        # 首次注水填满线程池
-        self._fill_executor(opts)
+        try:
+            cover_info = self._get_cover_hrefs_and_ids() if opts.get('batch_rename') else None
+            html_contents = self._get_html_file_contents() if opts.get('batch_rename') else None
             
-        # Start checking the queue without freezing UI
-        self.root.after(50, lambda: self.check_queue(len(selected_imgs), opts))
+            self.btn_run.config(style="Processing.TButton", state=tk.DISABLED, text="⚙ 准备处理...")
+            
+            self.success_count = 0
+            self.error_count = 0
+            self.processed_count = 0
+            self.error_details.clear()
+            
+            self.staged_images = []
+            self.staged_id_map = {}
+            self.staged_href_map = {}
+            
+            self.prep_q = queue.Queue()
+            self._prep_status = 'pending'
+            
+            # [优化 6] 一次性初始化 manifest 索引集合，避免后续在循环中频繁重读
+            try:
+                self._existing_ids = {info[0] for info in self.bk.manifest_iter()}
+                self._existing_basenames = {info[1].split('/')[-1] for info in self.bk.manifest_iter()}
+            except Exception:
+                self._existing_ids = set()
+                self._existing_basenames = set()
+            
+            self.threads = os.cpu_count() or 4
+            self.executor = ThreadPoolExecutor(max_workers=self.threads)
+            
+            self.q = queue.Queue()
+            self.process_queue = deque(selected_imgs)
+            self.active_futures = {}
+            
+            self.executor.submit(self._async_prepare, selected_imgs, opts, cover_info, html_contents)
+            self._fill_executor(opts)
+            if not getattr(self, '_is_cancelled', False):
+                self._check_queue_job = self.root.after(100, lambda: self.check_queue(len(selected_imgs), opts))
+
+        except Exception as setup_err:
+            err_msg = f"初始化处理任务失败: {setup_err}\n{traceback.format_exc()}"
+            print(err_msg)
+            self.error_details.append(err_msg)
+            self._show_error_summary()
+            self._cleanup_temp_dir()
+            self._set_ui_enabled(True)
+
+    def _async_prepare(self, selected_imgs, opts, cover_info=None, html_contents=None):
+        """后台异步计算任务"""
+        if getattr(self, '_is_cancelled', False):
+            return
+        try:
+            if opts.get('batch_rename') and cover_info and html_contents:
+                opts['rename_stems'] = self._compute_rename_stems(selected_imgs, cover_info, html_contents)
+            if not getattr(self, '_is_cancelled', False):
+                self.prep_q.put((True, None))
+        except Exception as e:
+            err_msg = f"计算重命名索引异常: {e}\n{traceback.format_exc()}"
+            print(err_msg)
+            if not getattr(self, '_is_cancelled', False):
+                self.prep_q.put((False, err_msg))
 
     def process_single_image(self, img_info, opts, raw_data):
-        """Worker thread function to process a single image strictly using PIL."""
+        """工作线程：基于决策函数进行图片处理"""
+        if getattr(self, '_is_cancelled', False):
+            return
+
         try:
-            img = Image.open(BytesIO(raw_data))
-            
-            # 1. Rotate Application
-            if img_info['rotate']:
-                # Expand=True preserves edges for non-square rotations
-                img = img.rotate(img_info['rotate'], expand=True)
-                
-            orig_fmt = img.format if img.format else img_info['format']
-            if orig_fmt.upper() == 'JPG': orig_fmt = 'JPEG'
-            
-            target_fmt = opts['conv_target'] if opts['do_conv'] else orig_fmt
-            if target_fmt.upper() == 'JPG': target_fmt = 'JPEG'
-            
-            # 位深压缩自动跳过非 PNG 格式 (且无其他合并操作时直接跳过处理以避免冗余的编码解码)
-            if opts['do_depth'] and not opts['do_lossless']:
-                if target_fmt != 'PNG' and not img_info['rotate']:
-                    self.q.put((True, img_info['id'], None, target_fmt))
+            with Image.open(BytesIO(raw_data)) as img:
+                img = ImageOps.exif_transpose(img)
+                img = convert_cmyk_to_rgb(img)
+
+                is_animated = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
+                if is_animated:
+                    if not getattr(self, '_is_cancelled', False):
+                        self.q.put((True, img_info['id'], None, img_info['format']))
                     return
-            
-            # Safely handle transparency when converting to JPEG
-            if target_fmt == 'JPEG' and img.mode in ('RGBA', 'P', 'LA'):
-                bg = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode in ('RGBA', 'LA'):
-                    bg.paste(img, mask=img.split()[-1])
-                else:
-                    bg.paste(img)
-                img = bg
+
+                needs_reencode, target_fmt = should_reencode_image(img_info, opts, img)
+                if not needs_reencode:
+                    if not getattr(self, '_is_cancelled', False):
+                        self.q.put((True, img_info['id'], None, target_fmt))
+                    return
+
+                rot_angle = img_info.get('rotate', 0)
+                if rot_angle != 0:
+                    img = img.rotate(-rot_angle, expand=True)
+
+                cur_w, cur_h = img.size
+                if cur_w * cur_h > MAX_PIXELS:
+                    raise ValueError(f"原始图片尺寸超出安全上限 ({cur_w}×{cur_h} > {MAX_PIXELS} 像素)")
+
+                if opts.get('do_scale'):
+                    stype = opts.get('scale_type')
+                    new_w, new_h = cur_w, cur_h
+                    
+                    if stype == "percent":
+                        factor = opts.get('scale_percent') / 100.0
+                        new_w = max(1, int(cur_w * factor))
+                        new_h = max(1, int(cur_h * factor))
+                    elif stype == "width":
+                        val = opts.get('scale_width')
+                        if cur_w > 0:
+                            new_w = val
+                            new_h = max(1, int(cur_h * (val / cur_w)))
+                    elif stype == "height":
+                        val = opts.get('scale_height')
+                        if cur_h > 0:
+                            new_h = val
+                            new_w = max(1, int(cur_w * (val / cur_h)))
+                                
+                    if new_w * new_h > MAX_PIXELS:
+                        raise ValueError(f"缩放后尺寸超出安全上限 ({new_w}×{new_h} > {MAX_PIXELS} 像素)")
+
+                    if (new_w, new_h) != (cur_w, cur_h):
+                        resample_filter = get_resample_filter(cur_w, cur_h, new_w, new_h)
+                        img = img.resize((new_w, new_h), resample_filter)
+
+                save_kwargs = {}
                 
-            # Convert WebP from RGBA to RGB if alpha is empty/unneeded (Optional optimization)
-            if target_fmt != 'JPEG' and img.mode not in ('RGB', 'RGBA', 'P'):
-                img = img.convert('RGBA')
-            
-            # 2. Color Depth (8-bit P mode)
-            if opts['do_depth'] and target_fmt == 'PNG':
-                try:
-                    # Attempt imagequant if available in Sigil env
-                    import imagequant
-                    img = imagequant.quantize_pil_image(img, max_quality=100)
-                except ImportError:
-                    # Native PIL fallback
-                    img = img.convert('P', palette=Image.ADAPTIVE, colors=256)
-                
-            save_kwargs = {'format': target_fmt}
-            
-            # 3. Quality configuration
-            if opts['do_conv'] and opts['conv_type'] == 'quality':
-                if target_fmt in ('JPEG', 'WEBP'):
-                    save_kwargs['quality'] = opts['conv_qlty']
-            elif opts['do_qlty']:
+                if opts.get('strip_meta'):
+                    clean_info = {}
+                    for key in ('duration', 'loop'):
+                        if key in img.info:
+                            clean_info[key] = img.info[key]
+                    img.info = clean_info
+                    
+                    if hasattr(img, 'getexif'):
+                        try:
+                            exif = img.getexif()
+                            if exif is not None:
+                                exif.clear()
+                        except Exception:
+                            pass
+                    
+                    if target_fmt in ('JPEG', 'WEBP', 'TIFF'):
+                        save_kwargs['exif'] = b""
+                    if target_fmt in ('JPEG', 'WEBP'):
+                        save_kwargs['icc_profile'] = None
+
                 if target_fmt == 'JPEG':
-                    save_kwargs['quality'] = opts['jpg_qlty']
-                elif target_fmt == 'WEBP':
-                    save_kwargs['quality'] = opts['webp_qlty']
-                    
-            # 4. Lossless configuration 
-            is_conv_lossless = opts['do_conv'] and opts['conv_type'] == 'lossless'
-            if is_conv_lossless or opts['do_lossless']:
-                if target_fmt in ('PNG', 'JPEG', 'WEBP'):
-                    save_kwargs['optimize'] = True
-                    
-                # 根据是“格式转换”还是“高级压缩”选用对应的级别值
-                lvl = opts['conv_lossless_level'] if is_conv_lossless else opts['lossless_level']
+                    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                        bg = Image.new('RGB', img.size, (255, 255, 255))
+                        rgba_img = img.convert('RGBA')
+                        bg.paste(rgba_img, mask=rgba_img.split()[3])
+                        img = bg
+                    elif img.mode != 'RGB':
+                        img = img.convert('RGB')
+                else:
+                    if img.mode not in ('RGB', 'RGBA', 'P'):
+                        img = img.convert('RGBA')
                 
-                if target_fmt == 'PNG':
-                    # PNG 允许的 zlib 压缩范围是 0-9
-                    save_kwargs['compress_level'] = min(9, lvl)
-                if target_fmt == 'WEBP':
-                    save_kwargs['lossless'] = True
-                    # WEBP 无损模式下 method 决定压缩耗时和体积（范围 0-6），超过6的视同最高级
-                    save_kwargs['method'] = min(6, lvl)
+                if opts['do_depth'] and target_fmt == 'PNG':
+                    if HAS_IMAGEQUANT:
+                        try:
+                            import imagequant
+                            if img.mode != 'RGBA':
+                                img = img.convert('RGBA')
+                            img = imagequant.quantize_pil_image(img, max_quality=100)
+                        except Exception:
+                            img = img.convert('P', palette=Image.ADAPTIVE, colors=256)
+                    else:
+                        img = img.convert('P', palette=Image.ADAPTIVE, colors=256)
                     
-            # Write compressed output to memory
-            out_io = BytesIO()
-            img.save(out_io, **save_kwargs)
-            new_data = out_io.getvalue()
+                save_kwargs['format'] = target_fmt
+                
+                if opts['do_conv'] and opts['conv_type'] == 'quality':
+                    if target_fmt in ('JPEG', 'WEBP'):
+                        save_kwargs['quality'] = opts['conv_qlty']
+                elif opts['do_qlty']:
+                    if target_fmt == 'JPEG':
+                        save_kwargs['quality'] = opts['jpg_qlty']
+                    elif target_fmt == 'WEBP':
+                        save_kwargs['quality'] = opts['webp_qlty']
+                        
+                is_conv_lossless = opts['do_conv'] and opts['conv_type'] == 'lossless'
+                if is_conv_lossless or opts['do_lossless']:
+                    if target_fmt in ('PNG', 'JPEG', 'WEBP'):
+                        save_kwargs['optimize'] = True
+                        
+                    lvl = opts['conv_lossless_level'] if is_conv_lossless else opts['lossless_level']
+                    
+                    # [优化 1] 若 JPEG 强制重新编码且处于无损模式下，采用最高采样质量参数
+                    if target_fmt == 'JPEG':
+                        save_kwargs['quality'] = 95
+                        save_kwargs['subsampling'] = 0
+                    elif target_fmt == 'PNG':
+                        save_kwargs['compress_level'] = min(9, lvl)
+                    elif target_fmt == 'WEBP':
+                        save_kwargs['lossless'] = True
+                        save_kwargs['method'] = min(6, lvl)
+                        
+                out_io = BytesIO()
+                img.save(out_io, **save_kwargs)
+                new_data = out_io.getvalue()
+                
+                if not getattr(self, '_is_cancelled', False):
+                    self.q.put((True, img_info['id'], new_data, target_fmt))
             
-            # 将目标格式 target_fmt 也传递回主线程
-            self.q.put((True, img_info['id'], new_data, target_fmt))
-            
+        except UnidentifiedImageError:
+            err_msg = "无法识别的图像格式或图片文件已损坏 (UnidentifiedImageError)"
+            if not getattr(self, '_is_cancelled', False):
+                self.q.put((False, img_info['id'], err_msg, None))
+        except MemoryError:
+            err_msg = "图像处理失败：内存不足 (MemoryError)"
+            if not getattr(self, '_is_cancelled', False):
+                self.q.put((False, img_info['id'], err_msg, None))
+        except (OSError, IOError) as os_err:
+            err_msg = f"图像解码/读取失败，数据可能损坏或不完整: {os_err}"
+            if not getattr(self, '_is_cancelled', False):
+                self.q.put((False, img_info['id'], err_msg, None))
+        except ValueError as val_err:
+            err_msg = f"图像参数校验失败: {val_err}"
+            if not getattr(self, '_is_cancelled', False):
+                self.q.put((False, img_info['id'], err_msg, None))
         except Exception as e:
-            self.q.put((False, img_info['id'], str(e), None))
+            err_tb = traceback.format_exc()
+            if not getattr(self, '_is_cancelled', False):
+                self.q.put((False, img_info['id'], f"未知处理异常: {e}\n{err_tb}", None))
 
     def check_queue(self, total, opts):
-        """Periodic UI-loop function to collect completed tasks and update Sigil."""
+        """UI 轮询机制"""
+        self._check_queue_job = None
+        
+        if getattr(self, '_is_cancelled', False):
+            return
+
+        if self.bk is None:
+            self._set_ui_enabled(True)
+            return
+
+        if getattr(self, '_prep_status', 'pending') == 'pending':
+            try:
+                prep_ok, prep_err = self.prep_q.get_nowait()
+                if prep_ok:
+                    self._prep_status = 'done'
+                else:
+                    self._prep_status = 'failed'
+                    if prep_err:
+                        self.error_details.append(prep_err)
+            except queue.Empty:
+                if not getattr(self, '_is_cancelled', False):
+                    self.btn_run.config(text="⚙ 正在计算重命名...")
+                    self._check_queue_job = self.root.after(100, lambda: self.check_queue(total, opts))
+                return
+
+        if self._prep_status == 'failed':
+            if self.executor:
+                try:
+                    self.executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    self.executor.shutdown(wait=False)
+            self.btn_run.config(style="Error.TButton", text="❌ 准备失败")
+            self._show_error_summary()
+            self._cleanup_temp_dir()
+            self._set_ui_enabled(True)
+            return
+
         try:
-            while True:
+            while not getattr(self, '_is_cancelled', False):
                 success, img_id, result, target_fmt = self.q.get_nowait()
                 self.processed_count += 1
                 
                 if success:
-                    self.success_count += 1
-                    
-                    if result is None:
-                        # 文件被自动跳过（例如非 PNG 格式的位深压缩），无需写入新文件或更改引用
-                        pass
-                    else:
-                        try:
-                            # 遵循 Sigil 官方规范：更改格式需新建文件并修改 HTML 引用
-                            old_href = self.bk.id_to_href(img_id)
-                            old_basename = old_href.split('/')[-1]
-                            old_ext = old_basename.rsplit('.', 1)[-1].upper()
-                            if old_ext == 'JPG': old_ext = 'JPEG'
+                    try:
+                        temp_path = None
+                        if result is not None and getattr(self, 'temp_dir', None) is not None:
+                            try:
+                                tmp_filename = f"tmp_{re.sub(r'[^\w\-]', '_', img_id)}.bin"
+                                temp_path = os.path.join(self.temp_dir.name, tmp_filename)
+                                with open(temp_path, 'wb') as tf:
+                                    tf.write(result)
+                                result = None
+                            except Exception as e:
+                                print(f"写入临时文件失败: {e}")
+
+                        old_href = posixpath.normpath(self.bk.id_to_href(img_id))
+                        old_basename = old_href.split('/')[-1]
+                        old_ext = old_basename.rsplit('.', 1)[-1].upper() if '.' in old_basename else 'PNG'
+                        if old_ext == 'JPG': old_ext = 'JPEG'
+                        
+                        new_ext = target_fmt.lower() if target_fmt else old_ext.lower()
+                        if new_ext == 'jpeg': new_ext = 'jpg'
+                        
+                        rename_stems = opts.get('rename_stems', {})
+                        is_batch_renamed = opts.get('batch_rename') and img_id in rename_stems
+                        
+                        if is_batch_renamed:
+                            name_part = rename_stems[img_id]
+                        else:
+                            name_part = old_basename.rsplit('.', 1)[0]
                             
-                            # 判断是否需要更改后缀名
-                            if target_fmt.upper() != old_ext:
-                                new_ext = target_fmt.lower()
-                                if new_ext == 'jpeg': new_ext = 'jpg'
+                        new_basename = f"{name_part}.{new_ext}"
+                        
+                        if new_basename != old_basename:
+                            clean_stem = re.sub(r'[^\w\-]', '_', name_part)
+                            new_id = f"img_{clean_stem}_{new_ext}"
+                            
+                            # [优化 6] 直接更新 Python 内存 Set，剔除原本重复遍历 self.bk.manifest_iter() 的开销
+                            self._existing_ids.discard(img_id)
+                            self._existing_basenames.discard(old_basename)
+                            
+                            counter = 1
+                            base_new_id = new_id
+                            while new_id in self._existing_ids or new_basename in self._existing_basenames:
+                                new_id = f"{base_new_id}_{counter}"
+                                new_basename = f"{name_part}_{counter}.{new_ext}"
+                                counter += 1
                                 
-                                name_part = old_basename.rsplit('.', 1)[0]
-                                new_basename = f"{name_part}.{new_ext}"
-                                new_id = f"{img_id}_{new_ext}"
-                                
-                                # ID和文件名去重算法：确保新生成的标识符在整个 EPUB 中绝对唯一
-                                counter = 1
-                                while new_id in self._existing_ids or new_basename in self._existing_basenames:
-                                    new_id = f"{img_id}_{new_ext}_{counter}"
-                                    new_basename = f"{name_part}_{counter}.{new_ext}"
-                                    counter += 1
-                                    
-                                self._existing_ids.add(new_id)
-                                self._existing_basenames.add(new_basename)
-                                
-                                # 1. 添加新格式文件  2. 删除旧格式文件  3. 记录映射关系
-                                self.bk.addfile(new_id, new_basename, result)
-                                self.bk.deletefile(img_id)
-                                self.rename_map[old_basename] = new_basename
-                                self.id_map[img_id] = new_id
-                                
-                                # 记录包含文件层次的完整引用路径映射关系
-                                if '/' in old_href:
-                                    new_href = old_href.rsplit('/', 1)[0] + '/' + new_basename
-                                else:
-                                    new_href = new_basename
-                                self.href_map[old_href] = new_href
+                            self._existing_ids.add(new_id)
+                            self._existing_basenames.add(new_basename)
+                            
+                            if '/' in old_href:
+                                new_href = posixpath.normpath(old_href.rsplit('/', 1)[0] + '/' + new_basename)
                             else:
-                                # 格式未变，原地覆盖原有数据即可
-                                self.bk.writefile(img_id, result)
-                        except Exception as op_err:
-                            print(f"Error saving {img_id}: {op_err}")
-                            self.error_count += 1
+                                new_href = new_basename
+                                
+                            self.staged_id_map[img_id] = new_id
+                            self.staged_href_map[old_href] = new_href
+                            
+                            self.staged_images.append({
+                                'id': img_id,
+                                'new_id': new_id,
+                                'new_basename': new_basename,
+                                'old_href': old_href,
+                                'new_href': new_href,
+                                'temp_path': temp_path,
+                                'data': result,
+                                'action': 'add_delete'
+                            })
+                        else:
+                            self.staged_images.append({
+                                'id': img_id,
+                                'new_id': img_id,
+                                'new_basename': old_basename,
+                                'old_href': old_href,
+                                'new_href': old_href,
+                                'temp_path': temp_path,
+                                'data': result,
+                                'action': 'write' if (temp_path or result is not None) else 'none'
+                            })
+                            
+                    except Exception as stage_err:
+                        err_msg = f"暂存图片 {img_id} 处理失败: {stage_err}\n{traceback.format_exc()}"
+                        print(err_msg)
+                        self.error_details.append(err_msg)
+                        self.error_count += 1
                 else:
                     self.error_count += 1
-                    print(f"Error processing {img_id}: {result}")
+                    err_msg = f"处理图片 {img_id} 失败: {result}"
+                    print(err_msg)
+                    self.error_details.append(err_msg)
                     
         except queue.Empty:
             pass
+
+        if getattr(self, '_is_cancelled', False):
+            return
             
-        # 剥离已完成的任务池引用
+        progress_percent = int((self.processed_count / total) * 100) if total > 0 else 0
+        self.btn_run.config(text=f"⚙ 处理进度 {progress_percent}%")
+            
         done_futures = [f for f in self.active_futures if f.done()]
         for f in done_futures:
             del self.active_futures[f]
             
-        # 及时补充分块读取的任务
         self._fill_executor(opts)
             
-        # Completion check
         if self.processed_count >= total:
-            self.executor.shutdown(wait=False)
-            
-            # --- 统一更新受格式转换影响的 HTML 和 CSS 引用 ---
-            if hasattr(self, 'rename_map') and self.rename_map:
-                self._update_all_references()
-                self.rename_map = {}
-                self.id_map = {}
-                self.href_map = {}
-            
-            # Reset button state
-            self.btn_run.config(style="Accent.TButton", text="🚀 执 行 处 理")
-            
-            # Refresh internal lists
-            self.images = []
-            self.init_data()
-            self.refresh_tree()
-            self.update_states()
-        else:
-            self.root.after(50, lambda: self.check_queue(total, opts))
-
-    def _update_all_references(self):
-        """Updates all HTML and CSS files if image filenames were changed due to format conversion."""
-        if not hasattr(self, 'rename_map') or not self.rename_map:
-            return
-            
-        import re
-        import posixpath
-        from urllib.parse import unquote
-        
-        def get_bookpath(base_href, rel_path):
-            """引入 get_bookpath 用于将相对路径解析为书籍根目录下的绝对 bookpath"""
-            return posixpath.normpath(posixpath.join(posixpath.dirname(base_href), rel_path))
-        
-        # 精确锚定包含引用的标签结构，提取 URL (参考官方 plugin_2.py 做法)
-        # 支持匹配： src="...", href="...", xlink:href="..." (添加了 source 标签的支持)
-        html_img_pattern = re.compile(r'(<(?:img|image|source)[^>]*?(?:src|xlink:href|href)\s*=\s*)([\'"])(.*?)([\'"])([^>]*?>)', re.IGNORECASE)
-        # 支持匹配 srcset="..."
-        html_srcset_pattern = re.compile(r'(<(?:img|image|source)[^>]*?srcset\s*=\s*)([\'"])(.*?)([\'"])([^>]*?>)', re.IGNORECASE)
-        # 支持匹配 css / html inline style 中的 url(...)
-        css_url_pattern = re.compile(r'(\burl\s*\(\s*)([\'"]?)(.*?)([\'"]?\s*\))', re.IGNORECASE)
-
-        def _url_replacer(match, current_file_href, is_html_tag=False):
-            if is_html_tag:
-                prefix, quote1, href, quote2, suffix = match.groups()
-            else:
-                prefix, quote1, href, suffix = match.groups()
-                quote2 = ""
-                
-            # 提取 basename (兼容 / # ? 等锚点)
-            raw_url = href.split('#')[0].split('?')[0]
-            unquoted_url = unquote(raw_url) # 处理 %20 空格等转义字符
-            
-            # 跳过数据 URL 与外部链接
-            if not unquoted_url or unquoted_url.startswith('data:') or unquoted_url.startswith('http'):
-                return match.group(0)
-                
-            book_path = get_bookpath(current_file_href, unquoted_url)
-            
-            if hasattr(self, 'href_map') and book_path in self.href_map:
-                new_book_path = self.href_map[book_path]
-                
-                # 引入 bk.get_relativepath 对处理逻辑进一步优化，基于目标文件与当前宿主文件间的相对层级还原相对路径
+            if self.executor:
                 try:
-                    new_rel_path = self.bk.get_relativepath(current_file_href, new_book_path)
-                except AttributeError:
-                    # Fallback 处理：兼容可能没有暴露此原生 API 的早期版本 Sigil
-                    new_rel_path = posixpath.relpath(new_book_path, posixpath.dirname(current_file_href))
-                    
-                # 还原锚点和查询参数
-                suffix_idx = len(raw_url)
-                remainder = href[suffix_idx:]
-                href = new_rel_path + remainder
-                
+                    self.executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    self.executor.shutdown(wait=False)
+            
+            staged_writes, staged_metadata, ref_ok = self._stage_all_references()
+            
+            if ref_ok and self.error_count == 0:
+                try:
+                    self._commit_all_changes(staged_writes, staged_metadata)
+                except Exception as commit_exc:
+                    err_msg = f"提交物理变更发生未预期异常: {commit_exc}"
+                    print(err_msg)
+                    if err_msg not in self.error_details:
+                        self.error_details.append(err_msg)
             else:
-                # Fallback: 保留原有的按文件名末尾匹配的逻辑（作为在某些极端情况下路径未能精确计算时的备份措施）
-                raw_basename = raw_url.split('/')[-1]
-                if raw_basename in self.rename_map:
-                    new_basename = self.rename_map[raw_basename]
-                    href = href[:href.rfind(raw_basename)] + new_basename
+                abort_msg = "由于处理过程中存在错误，已取消提交物理修改，EPUB 文件保持原样。"
+                print(abort_msg)
+                self.error_details.append(abort_msg)
+
+            self._cleanup_temp_dir()
+
+            if not getattr(self, '_is_cancelled', False):
+                self.btn_run.config(style="Accent.TButton", text="🚀 执 行 处 理")
                 
-            return f"{prefix}{quote1}{href}{quote2}{suffix}" if is_html_tag else f"{prefix}{quote1}{href}{suffix}"
+                if self.error_details:
+                    self._show_error_summary()
+                
+                self.images = []
+                self.init_data()
+                self._set_ui_enabled(True)
+                self.refresh_tree()
+                self.update_states()
+        else:
+            if not getattr(self, '_is_cancelled', False):
+                self._check_queue_job = self.root.after(100, lambda: self.check_queue(total, opts))
+
+    def _stage_all_references(self):
+        """Phase 1: 内存计算全书 HTML/CSS/SVG 引用更新"""
+        if self.bk is None or not self.staged_href_map:
+            return {}, None, True
+
+        staged_writes = {}
+        staged_metadata = None
+
+        def _url_replacer(match, current_file_href):
+            groups = match.groups()
+            if len(groups) == 5:
+                prefix, quote1, href, quote2, suffix = groups
+            elif len(groups) == 4:
+                prefix, quote1, href, suffix = groups
+                quote2 = ""
+            else:
+                return match.group(0)
+
+            book_path, extra_suffix = normalize_epub_path(current_file_href, href)
+            if not book_path:
+                return match.group(0)
+
+            raw_ext = posixpath.splitext(book_path.lower())[1]
+            if raw_ext and raw_ext not in IMAGE_EXTENSIONS:
+                return match.group(0)
+
+            if book_path in self.staged_href_map:
+                new_book_path = self.staged_href_map[book_path]
+                new_rel_path = get_relative_epub_path(current_file_href, new_book_path)
+                encoded_rel_path = quote(new_rel_path, safe='/')
+                new_href = encoded_rel_path + extra_suffix
+            else:
+                new_href = href
+
+            return f"{prefix}{quote1}{new_href}{quote2}{suffix}" if len(groups) == 5 else f"{prefix}{quote1}{new_href}{suffix}"
 
         def _srcset_replacer(match, current_file_href):
-            prefix, quote1, srcset_val, quote2, suffix = match.groups()
-            
+            groups = match.groups()
+            prefix = groups[0]
+            if groups[1] is not None:
+                quote1 = groups[1]
+                srcset_val = groups[2]
+                quote2 = groups[3]
+            else:
+                quote1 = ""
+                srcset_val = groups[4]
+                quote2 = ""
+            suffix = groups[5]
+
+            if not srcset_val:
+                return match.group(0)
+
             parts = srcset_val.split(',')
             new_parts = []
+
             for part in parts:
                 stripped_part = part.strip()
                 if not stripped_part:
                     continue
-                
-                # srcset 的每一项可能包含 URL 和 尺寸描述符 (如 "image.jpg 2x")
+
                 tokens = stripped_part.split()
                 if not tokens:
                     new_parts.append(part)
                     continue
-                    
+
                 raw_url = tokens[0]
-                unquoted_url = unquote(raw_url.split('#')[0].split('?')[0])
-                
-                if not unquoted_url or unquoted_url.startswith('data:') or unquoted_url.startswith('http'):
+                book_path, extra_suffix = normalize_epub_path(current_file_href, raw_url)
+                if not book_path:
                     new_parts.append(part)
                     continue
-                    
-                book_path = get_bookpath(current_file_href, unquoted_url)
-                new_url = raw_url
-                
-                if hasattr(self, 'href_map') and book_path in self.href_map:
-                    new_book_path = self.href_map[book_path]
-                    
-                    try:
-                        new_rel_path = self.bk.get_relativepath(current_file_href, new_book_path)
-                    except AttributeError:
-                        new_rel_path = posixpath.relpath(new_book_path, posixpath.dirname(current_file_href))
-                        
-                    suffix_idx = len(raw_url.split('#')[0].split('?')[0])
-                    new_url = new_rel_path + raw_url[suffix_idx:]
-                else:
-                    # Fallback 处理
-                    raw_basename = unquoted_url.split('/')[-1]
-                    if raw_basename in self.rename_map:
-                        new_basename = self.rename_map[raw_basename]
-                        new_url = raw_url[:raw_url.rfind(raw_basename)] + new_basename
-                        
-                tokens[0] = new_url
+
+                raw_ext = posixpath.splitext(book_path.lower())[1]
+                if raw_ext and raw_ext not in IMAGE_EXTENSIONS:
+                    new_parts.append(part)
+                    continue
+
+                if book_path in self.staged_href_map:
+                    new_book_path = self.staged_href_map[book_path]
+                    new_rel_path = get_relative_epub_path(current_file_href, new_book_path)
+                    encoded_rel_path = quote(new_rel_path, safe='/')
+                    tokens[0] = encoded_rel_path + extra_suffix
+
                 new_parts.append(" ".join(tokens))
-                
+
             new_srcset = ", ".join(new_parts)
             return f"{prefix}{quote1}{new_srcset}{quote2}{suffix}"
 
-        # 遍历更新所有 HTML 文件
-        for html_id, html_href in self.bk.text_iter():
-            try:
-                html_data = self.bk.readfile(html_id)
-                is_bytes = isinstance(html_data, bytes)
-                text = html_data.decode('utf-8') if is_bytes else html_data
-                
-                # 更新 <img> / <image> / <source> 标签的普通引用
-                new_text = html_img_pattern.sub(lambda m: _url_replacer(m, html_href, is_html_tag=True), text)
-                # 更新 srcset 属性
-                new_text = html_srcset_pattern.sub(lambda m: _srcset_replacer(m, html_href), new_text)
-                # 更新内联 style url()
-                new_text = css_url_pattern.sub(lambda m: _url_replacer(m, html_href, is_html_tag=False), new_text)
-                
-                if text != new_text:
-                    self.bk.writefile(html_id, new_text.encode('utf-8') if is_bytes else new_text)
-            except Exception as e:
-                print(f"Failed to update HTML references in {html_href}: {e}")
+        try:
+            if hasattr(self.bk, 'text_iter'):
+                for html_id, raw_html_href in self.bk.text_iter():
+                    html_href = posixpath.normpath(raw_html_href)
+                    html_data = self.bk.readfile(html_id)
+                    is_bytes = isinstance(html_data, bytes)
+                    # [优化 4] 使用 safe_decode_text 统一安全解码
+                    text = safe_decode_text(html_data)
 
-        # 遍历更新所有 CSS 文件
-        if hasattr(self.bk, 'css_iter'):
-            for css_id, css_href in self.bk.css_iter():
-                try:
+                    new_text = _RE_HTML_IMG.sub(lambda m, h=html_href: _url_replacer(m, h), text)
+                    new_text = _RE_HTML_SRCSET.sub(lambda m, h=html_href: _srcset_replacer(m, h), new_text)
+                    new_text = _RE_CSS_URL.sub(lambda m, h=html_href: _url_replacer(m, h), new_text)
+
+                    if text != new_text:
+                        staged_writes[html_id] = new_text.encode('utf-8') if is_bytes else new_text
+
+            if hasattr(self.bk, 'css_iter'):
+                for css_id, raw_css_href in self.bk.css_iter():
+                    css_href = posixpath.normpath(raw_css_href)
                     css_data = self.bk.readfile(css_id)
                     is_bytes = isinstance(css_data, bytes)
-                    text = css_data.decode('utf-8') if is_bytes else css_data
-                    
-                    # 注入当前所在的 CSS href 
-                    new_text = css_url_pattern.sub(lambda m: _url_replacer(m, css_href, is_html_tag=False), text)
-                    
+                    text = safe_decode_text(css_data)
+
+                    new_text = _RE_CSS_URL.sub(lambda m, h=css_href: _url_replacer(m, h), text)
+                    new_text = _RE_CSS_IMPORT.sub(lambda m, h=css_href: _url_replacer(m, h), new_text)
+
                     if text != new_text:
-                        self.bk.writefile(css_id, new_text.encode('utf-8') if is_bytes else new_text)
-                except Exception as e:
-                    print(f"Failed to update CSS references in {css_href}: {e}")
-                    
-        # --- 核心新增：同步更新 OPF Metadata 中的封面引用 ---
-        if hasattr(self, 'id_map') and self.id_map:
-            try:
+                        staged_writes[css_id] = new_text.encode('utf-8') if is_bytes else new_text
+
+            if hasattr(self.bk, 'manifest_iter'):
+                for item in self.bk.manifest_iter():
+                    svg_id = item[0]
+                    svg_href = posixpath.normpath(item[1])
+                    if svg_href.lower().endswith('.svg'):
+                        svg_data = self.bk.readfile(svg_id)
+                        if not svg_data:
+                            continue
+                        is_bytes = isinstance(svg_data, bytes)
+                        text = safe_decode_text(svg_data)
+
+                        new_text = _RE_HTML_IMG.sub(lambda m, h=svg_href: _url_replacer(m, h), text)
+                        new_text = _RE_HTML_SRCSET.sub(lambda m, h=svg_href: _srcset_replacer(m, h), new_text)
+                        new_text = _RE_CSS_URL.sub(lambda m, h=svg_href: _url_replacer(m, h), new_text)
+
+                        if text != new_text:
+                            staged_writes[svg_id] = new_text.encode('utf-8') if is_bytes else new_text
+
+            if self.staged_id_map:
                 metadata = self.bk.getmetadataxml()
                 if metadata:
                     def _meta_replacer(m):
                         tag = m.group(0)
-                        # 查找 content="..." 提取关联的 ID
                         c_match = re.search(r'(content\s*=\s*[\'"])(.*?)([\'"])', tag, re.IGNORECASE)
                         if c_match:
                             old_id = c_match.group(2)
-                            if old_id in self.id_map:
-                                return tag[:c_match.start(2)] + self.id_map[old_id] + tag[c_match.end(2):]
+                            if old_id in self.staged_id_map:
+                                return tag[:c_match.start(2)] + self.staged_id_map[old_id] + tag[c_match.end(2):]
                         return tag
-                        
-                    # 正反两套顺序兼容匹配（匹配 name="cover" 或者先 content="..." 后 name="cover"）
+
                     new_metadata = re.sub(r'<[a-zA-Z0-9:]*?meta\s+[^>]*?name\s*=\s*[\'"]cover[\'"][^>]*?>', _meta_replacer, metadata, flags=re.IGNORECASE)
                     if new_metadata == metadata:
                         new_metadata = re.sub(r'<[a-zA-Z0-9:]*?meta\s+[^>]*?content\s*=\s*[\'"][^\'"]*[\'"][^>]*?name\s*=\s*[\'"]cover[\'"][^>]*?>', _meta_replacer, metadata, flags=re.IGNORECASE)
-                        
+
                     if new_metadata != metadata:
-                        self.bk.setmetadataxml(new_metadata)
-            except Exception as e:
-                print(f"Failed to update metadata cover ID: {e}")
+                        staged_metadata = new_metadata
+
+            return staged_writes, staged_metadata, True
+
+        except Exception as e:
+            err_msg = f"计算全书引用更新异常: {e}\n{traceback.format_exc()}"
+            print(err_msg)
+            self.error_details.append(err_msg)
+            return {}, None, False
+
+    def _commit_all_changes(self, staged_writes, staged_metadata):
+        """
+        Phase 2: 提交变更到 Sigil EPUB 容器。
+        [优化 2] 增强原子回滚机制：备份图片二进制、文本及 OPF 元数据，遇错完全还原。
+        """
+        added_ids = []
+        written_backups = {}  # {img_id: original_raw_bytes}
+        text_backups = {}     # {file_id: original_raw_content}
+        original_metadata = None
+        
+        try:
+            # 1. 备份图片原始字节
+            for item in self.staged_images:
+                if item['action'] == 'write' and (item.get('temp_path') or item.get('data') is not None):
+                    orig_data = self.bk.readfile(item['id'])
+                    if orig_data is not None:
+                        written_backups[item['id']] = orig_data
+
+            # 2. [优化 2] 备份将要被修改的文本与 OPF 元数据内容
+            for file_id in staged_writes.keys():
+                orig_text = self.bk.readfile(file_id)
+                if orig_text is not None:
+                    text_backups[file_id] = orig_text
+
+            if staged_metadata:
+                original_metadata = self.bk.getmetadataxml()
+
+            # 步骤一：添加新图片
+            for item in self.staged_images:
+                if item['action'] == 'add_delete':
+                    data = self._get_staged_data(item)
+                    if data is None:
+                        data = self.bk.readfile(item['id'])
+                    
+                    if isinstance(data, str):
+                        data = data.encode('utf-8')
+                    
+                    try:
+                        self.bk.addfile(item['new_id'], item['new_href'], data)
+                        added_ids.append(item['new_id'])
+                    except Exception as add_err:
+                        raise RuntimeError(f"添加新图片 '{item['new_basename']}' (ID: {item['new_id']}) 失败: {add_err}")
+
+            # 步骤二：覆写图片
+            for item in self.staged_images:
+                if item['action'] == 'write':
+                    data = self._get_staged_data(item)
+                    if data is not None:
+                        try:
+                            self._write_binary_file(item['id'], data)
+                        except Exception as write_err:
+                            raise RuntimeError(f"覆写图片 '{item['id']}' 内容失败: {write_err}")
+                    self.success_count += 1
+
+            # 步骤三：更新 HTML / CSS / SVG 文件
+            for file_id, content in staged_writes.items():
+                try:
+                    self.bk.writefile(file_id, content)
+                except TypeError:
+                    if isinstance(content, str):
+                        self.bk.writefile(file_id, content.encode('utf-8'))
+                    elif isinstance(content, bytes):
+                        self.bk.writefile(file_id, content.decode('utf-8', errors='ignore'))
+                except Exception as ref_err:
+                    raise RuntimeError(f"更新 HTML/CSS/SVG 引用文件 '{file_id}' 失败: {ref_err}")
+
+            if staged_metadata:
+                try:
+                    self.bk.setmetadataxml(staged_metadata)
+                except Exception as meta_err:
+                    raise RuntimeError(f"更新元数据 (OPF) 失败: {meta_err}")
+
+            # 步骤四：物理删除旧文件
+            for item in self.staged_images:
+                if item['action'] == 'add_delete':
+                    try:
+                        self.bk.deletefile(item['id'])
+                    except Exception as del_err:
+                        print(f"警告: 清除原旧图片 '{item['id']}' 失败: {del_err}")
+                    self.success_count += 1
+
+        except Exception as commit_err:
+            print(f"物理提交过程捕获致命异常，正在启动完整原子回滚策略: {commit_err}")
+            
+            # 回滚 1：删除新添加的图片
+            for rollback_id in list(added_ids):
+                try:
+                    self.bk.deletefile(rollback_id)
+                except Exception as rb_e:
+                    print(f"回滚删除已添加图片 '{rollback_id}' 失败: {rb_e}")
+            added_ids.clear()
+
+            # 回滚 2：还原覆盖的图片
+            for write_id, orig_bytes in written_backups.items():
+                try:
+                    self._write_binary_file(write_id, orig_bytes)
+                except Exception as rb_w:
+                    print(f"回滚还原已覆盖图片 '{write_id}' 失败: {rb_w}")
+            written_backups.clear()
+
+            # 回滚 3：还原修改的 HTML/CSS/SVG 文本
+            for file_id, orig_content in text_backups.items():
+                try:
+                    self.bk.writefile(file_id, orig_content)
+                except Exception as rb_t:
+                    print(f"回滚还原文本文件 '{file_id}' 失败: {rb_t}")
+            text_backups.clear()
+
+            # 回滚 4：还原 OPF 元数据
+            if original_metadata:
+                try:
+                    self.bk.setmetadataxml(original_metadata)
+                except Exception as rb_m:
+                    print(f"回滚还原 OPF 元数据失败: {rb_m}")
+
+            err_msg = f"物理提交到 Sigil 时发生错误 (已完整回滚图片、文本及 OPF 元数据，保持 EPUB 原样): {commit_err}\n{traceback.format_exc()}"
+            print(err_msg)
+            if err_msg not in self.error_details:
+                self.error_details.append(err_msg)
+            raise
+
+    def _show_error_summary(self):
+        """异常信息汇总窗口"""
+        if not self.error_details or getattr(self, '_is_cancelled', False):
+            return
+
+        err_win = tk.Toplevel(self.root)
+        err_win.title("⚠️ 插件处理异常汇总")
+        err_win.geometry("680x440")
+        err_win.minsize(550, 320)
+        err_win.transient(self.root)
+        err_win.grab_set()
+        
+        main_f = ttk.Frame(err_win, padding=15)
+        main_f.pack(fill=tk.BOTH, expand=True)
+        
+        header_text = f"执行过程中共发现 {len(self.error_details)} 项异常或警告："
+        lbl_head = ttk.Label(main_f, text=header_text, font=(self.os_font, 10, "bold"), foreground="#e74c3c")
+        lbl_head.pack(anchor=tk.W, pady=(0, 10))
+        
+        text_frame = ttk.Frame(main_f)
+        text_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+        
+        txt = tk.Text(text_frame, bg="#fafafa", fg="#2c3e50", font=(self.os_font, 9), relief=tk.SOLID, bd=1, wrap=tk.WORD)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        sb = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=txt.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.configure(yscrollcommand=sb.set)
+        
+        for idx, item in enumerate(self.error_details, 1):
+            txt.insert(tk.END, f"【异常记录 {idx}】\n{item.strip()}\n\n")
+        txt.config(state=tk.DISABLED)
+        
+        btn_bar = ttk.Frame(main_f)
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        def copy_log():
+            log_content = "\n".join([f"【异常记录 {i+1}】\n{err}" for i, err in enumerate(self.error_details)])
+            err_win.clipboard_clear()
+            err_win.clipboard_append(log_content)
+            messagebox.showinfo("提示", "异常日志已成功复制到剪贴板！", parent=err_win)
+            
+        btn_copy = ttk.Button(btn_bar, text="📋 复制错误日志", command=copy_log, width=15)
+        btn_copy.pack(side=tk.LEFT, padx=(0, 10))
+        
+        btn_close = ttk.Button(btn_bar, text="关 闭", command=err_win.destroy, width=12)
+        btn_close.pack(side=tk.RIGHT)
+        
+        err_win.bind('<Escape>', lambda e: err_win.destroy())
+        
+        err_win.update_idletasks()
+        win_x = self.root.winfo_x() + (self.root.winfo_width() - 680) // 2
+        win_y = self.root.winfo_y() + (self.root.winfo_height() - 440) // 2
+        err_win.geometry(f"+{max(0, win_x)}+{max(0, win_y)}")
 
 def run(bk):
-    """
-    Standard Sigil Plugin Entry Function.
-    This replaces PyQt references with an isolated Tkinter app suitable for single-file deployment.
-    """
-    # 增强跨平台 UI 兼容性：主动设置 Windows 高 DPI 缩放感知
+    """Sigil 插件标准入口函数"""
     if sys.platform == 'win32':
         try:
             import ctypes
@@ -1021,10 +2224,8 @@ def run(bk):
         except Exception:
             pass
 
-    # 环境与依赖完整性检查
     err_msg = check_dependencies()
     if err_msg:
-        # 将错误弹窗逻辑嵌入到入口处，防止阻塞加载并给出对应的修复指令
         err_root = tk.Tk()
         err_root.withdraw()
         
@@ -1032,11 +2233,9 @@ def run(bk):
         guide_win.title("⚠️ 插件环境异常")
         guide_win.geometry("600x360")
         
-        # 跨平台字体回退机制
         ui_font = ("微软雅黑" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "sans-serif", 10)
         code_font = ("Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "monospace", 10)
         
-        # 窗口居中
         guide_win.update_idletasks()
         win_x = (guide_win.winfo_screenwidth() // 2) - (600 // 2)
         win_y = (guide_win.winfo_screenheight() // 2) - (320 // 2)
@@ -1054,8 +2253,7 @@ def run(bk):
         )
         tk.Label(top_frame, text=info_text, justify=tk.LEFT, font=ui_font).pack(anchor=tk.W)
         
-        # 生成对应的 pip 安装命令
-        cmd_str = f'pip install Pillow imagequant --target="{str(_VENDOR_DIR)}"'
+        cmd_str = f'pip install Pillow --target="{str(_VENDOR_DIR)}"'
         
         text_box = tk.Text(top_frame, height=3, width=70, bg="#f5f6f7", font=code_font, relief=tk.FLAT)
         text_box.insert(tk.END, cmd_str)
@@ -1073,12 +2271,10 @@ def run(bk):
         err_root.destroy()
         return -1
 
-    # Boot Application
     try:
         root = tk.Tk()
         app = CompressApp(root, bk)
-        # 绑定窗口关闭事件，在退出时自动保存一次配置
-        root.protocol("WM_DELETE_WINDOW", lambda: (app.save_prefs(), root.destroy()))
+        root.protocol("WM_DELETE_WINDOW", app.close_app)
         root.mainloop()
     except Exception as e:
         print(traceback.format_exc())
@@ -1086,10 +2282,5 @@ def run(bk):
 
     return 0
 
-# For localized testing outside of Sigil
 if __name__ == "__main__":
     print("此脚本作为 Sigil 插件设计。请在 Sigil 环境中将其作为插件运行。")
-    # Uncomment to test UI locally without e-book context (Will load empty list)
-    # root = tk.Tk()
-    # app = CompressApp(root, None)
-    # root.mainloop()
