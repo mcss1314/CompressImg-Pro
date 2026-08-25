@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plugin>
-<name>SigilCompressImg-Pro</name>
+<name>CompressImg-Pro</name>
 <type>edit</type>
-<author>Ichigo_250</author>
+<author>Gemini Pro</author>
 <description>SigilCompressImg</description>
 <engine>python3.4</engine>
-<version>1.1.0</version>
+<version>1.1.2</version>
 <oslist>win,osx,unx</oslist>
 <autostart>true</autostart>
 <autoclose>true</autoclose>
