@@ -353,7 +353,7 @@ class CompressApp:
         
         self.prefs = self.load_prefs()
         
-        self.root.title("CompressImg-Pro V1.2")
+        self.root.title("CompressImg-Pro V1.3")
         self.root.geometry("1100x800")
         self.root.minsize(1050, 750)
         self.root.eval('tk::PlaceWindow . center')
@@ -1500,10 +1500,13 @@ class CompressApp:
             self.prep_q = queue.Queue()
             self._prep_status = 'pending'
             
-            # P1 修复：收集标准 EPUB 物理 Bookpath 集合，保留跨子目录组织架构
             try:
                 self._existing_ids = {info[0] for info in self.bk.manifest_iter()}
-                self._existing_bookpaths = {canonical_epub_path(self.bk.id_to_bookpath(info[0])) for info in self.bk.manifest_iter()}
+                self._existing_bookpaths = set()
+                for info in self.bk.manifest_iter():
+                    bp = self.bk.id_to_bookpath(info[0]) if hasattr(self.bk, 'id_to_bookpath') else self.bk.id_to_href(info[0])
+                    if bp:
+                        self._existing_bookpaths.add(canonical_epub_path(bp).lower())
             except Exception:
                 self._existing_ids = set()
                 self._existing_bookpaths = set()
@@ -1753,7 +1756,7 @@ class CompressApp:
                             except Exception as e:
                                 print(f"写入临时文件失败: {e}")
 
-                        # 修复：区分 Manifest href (OPF 相对路径) 与 Zip Root bookpath (容器绝对路径)
+                        # 区分 Manifest href (OPF 相对路径) 与 Zip Root bookpath (容器绝对路径)
                         old_href = canonical_epub_path(self.bk.id_to_href(img_id))
                         old_bookpath = canonical_epub_path(self.bk.id_to_bookpath(img_id)) if hasattr(self.bk, 'id_to_bookpath') else old_href
                         
@@ -1779,9 +1782,9 @@ class CompressApp:
                         candidate_bookpath = canonical_epub_path(posixpath.join(old_bookpath_dir, candidate_basename)) if old_bookpath_dir else candidate_basename
                         candidate_href = canonical_epub_path(posixpath.join(old_href_dir, candidate_basename)) if old_href_dir else candidate_basename
                         
-                        if candidate_bookpath != old_bookpath or is_batch_renamed:
+                        if candidate_bookpath.lower() != old_bookpath.lower() or is_batch_renamed:
                             self._existing_ids.discard(img_id)
-                            self._existing_bookpaths.discard(old_bookpath)
+                            self._existing_bookpaths.discard(old_bookpath.lower())
                             
                             clean_stem = re.sub(r'[^\w\-]', '_', name_part)
                             base_new_id = f"img_{clean_stem}_{new_ext}"
@@ -1794,17 +1797,17 @@ class CompressApp:
                                 id_counter += 1
                             self._existing_ids.add(new_id)
                             
-                            # P1 修复解耦 2：独立解决 EPUB 物理 Bookpath 冲突（精准保留 OEBPS/Images/ 架构）
+                            # P1 修复解耦 2：独立解决 EPUB 物理 Bookpath 冲突（精准保留 OEBPS/Images/ 架构，按小写比对检查大小写不敏感冲突）
                             new_basename = candidate_basename
                             new_bookpath = candidate_bookpath
                             new_href = candidate_href
                             href_counter = 1
-                            while new_bookpath in self._existing_bookpaths:
+                            while new_bookpath.lower() in self._existing_bookpaths:
                                 new_basename = f"{name_part}_{href_counter}.{new_ext}"
                                 new_bookpath = canonical_epub_path(posixpath.join(old_bookpath_dir, new_basename)) if old_bookpath_dir else new_basename
                                 new_href = canonical_epub_path(posixpath.join(old_href_dir, new_basename)) if old_href_dir else new_basename
                                 href_counter += 1
-                            self._existing_bookpaths.add(new_bookpath)
+                            self._existing_bookpaths.add(new_bookpath.lower())
                             
                             self.staged_id_map[img_id] = new_id
                             self.staged_href_map[old_href] = new_href
@@ -1885,7 +1888,6 @@ class CompressApp:
                 except Exception as commit_exc:
                     err_msg = f"提交物理变更发生未预期异常: {commit_exc}"
                     print(err_msg)
-                    # P2 修复：致命异常补全 error_count += 1
                     self.error_count += 1
                     if err_msg not in self.error_details:
                         self.error_details.append(err_msg)
@@ -2017,7 +2019,6 @@ class CompressApp:
                     new_text = _RE_CSS_URL.sub(lambda m, h=html_href: _url_replacer(m, h), new_text)
 
                     if text != new_text:
-                        # P2 修复：同步更新 XML 头部声明为 UTF-8
                         new_text = update_xml_encoding_header(new_text, "utf-8")
                         staged_writes[html_id] = new_text.encode('utf-8') if is_bytes else new_text
 
@@ -2085,17 +2086,26 @@ class CompressApp:
         deleted_backups = {}   # {img_id: (old_bookpath, original_raw_bytes, original_mime)}
         text_backups = {}      # {file_id: original_raw_content}
         original_metadata = None
+        resolved_data_map = {} # {img_id: raw_bytes}
         
         try:
-            # 1. 备份覆盖与将被删除的原图片数据（使用物理 Bookpath 路径）
+            # 1. 备份原数据并在执行任何物理修改前预先解析待写入的二进制数据
             for item in self.staged_images:
-                orig_data = self.bk.readfile(item['id'])
+                img_id = item['id']
+                orig_data = self.bk.readfile(img_id)
                 if orig_data is not None:
                     if item['action'] == 'write':
-                        written_backups[item['id']] = orig_data
+                        written_backups[img_id] = orig_data
                     elif item['action'] == 'add_delete':
                         orig_mime = get_image_mime(item['old_bookpath'])
-                        deleted_backups[item['id']] = (item['old_bookpath'], orig_data, orig_mime)
+                        deleted_backups[img_id] = (item['old_bookpath'], orig_data, orig_mime)
+                
+                # 预解析数据：优先读取暂存的处理结果，若无（如仅重命名未重编码）则使用备份的原数据
+                staged_data = self._get_staged_data(item)
+                if staged_data is not None:
+                    resolved_data_map[img_id] = staged_data
+                else:
+                    resolved_data_map[img_id] = orig_data
 
             # 2. 备份文本与元数据
             for file_id in staged_writes.keys():
@@ -2106,12 +2116,20 @@ class CompressApp:
             if staged_metadata:
                 original_metadata = self.bk.getmetadataxml()
 
-            # 步骤一：添加新图片（使用完整容器路径 new_bookpath，精准写入 OEBPS/Images/ 等子目录）
+            # 步骤一：物理删除将被替换或重命名的旧图片（必须先删后加以释放 ID 与 Bookpath 占位）
             for item in self.staged_images:
                 if item['action'] == 'add_delete':
-                    data = self._get_staged_data(item)
+                    try:
+                        self.bk.deletefile(item['id'])
+                    except Exception as del_err:
+                        raise RuntimeError(f"清除原旧图片 '{item['id']}' 物理文件失败: {del_err}")
+
+            # 步骤二：添加新图片（直接从 resolved_data_map 读取，不再调用已被删除的 ID 的 readfile）
+            for item in self.staged_images:
+                if item['action'] == 'add_delete':
+                    data = resolved_data_map.get(item['id'])
                     if data is None:
-                        data = self.bk.readfile(item['id'])
+                        raise RuntimeError(f"未找到待添加新图片 '{item['id']}' 的有效二进制数据")
                     
                     if isinstance(data, str):
                         data = data.encode('utf-8')
@@ -2120,21 +2138,22 @@ class CompressApp:
                     try:
                         self.bk.addbookpath(item['new_id'], item['new_bookpath'], data, mime=mime_type)
                         added_ids.append(item['new_id'])
+                        self.success_count += 1
                     except Exception as add_err:
                         raise RuntimeError(f"添加新图片 '{item['new_basename']}' (ID: {item['new_id']}) 失败: {add_err}")
 
-            # 步骤二：覆写图片
+            # 步骤三：覆写图片
             for item in self.staged_images:
                 if item['action'] == 'write':
-                    data = self._get_staged_data(item)
+                    data = resolved_data_map.get(item['id'])
                     if data is not None:
                         try:
                             self._write_binary_file(item['id'], data)
+                            self.success_count += 1
                         except Exception as write_err:
                             raise RuntimeError(f"覆写图片 '{item['id']}' 内容失败: {write_err}")
-                    self.success_count += 1
 
-            # 步骤三：更新文本引用
+            # 步骤四：更新文本引用
             for file_id, content in staged_writes.items():
                 try:
                     self.bk.writefile(file_id, content)
@@ -2146,26 +2165,12 @@ class CompressApp:
                 except Exception as ref_err:
                     raise RuntimeError(f"更新 HTML/CSS/SVG 引用文件 '{file_id}' 失败: {ref_err}")
 
-            # 步骤四：写入元数据 XML
+            # 步骤五：写入元数据 XML
             if staged_metadata:
                 try:
                     self.bk.setmetadataxml(staged_metadata)
                 except Exception as meta_err:
                     raise RuntimeError(f"更新元数据 (OPF) 失败: {meta_err}")
-
-            # 步骤五：物理删除旧文件（成功才自增；失败则抛出异常触发全量回滚）
-            for item in self.staged_images:
-                if item['action'] == 'add_delete':
-                    try:
-                        self.bk.deletefile(item['id'])
-                        self.success_count += 1
-                    except Exception as del_err:
-                        err_msg = f"清除原旧图片 '{item['id']}' 物理文件失败: {del_err}"
-                        print(f"警告: {err_msg}")
-                        self.error_count += 1
-                        if err_msg not in self.error_details:
-                            self.error_details.append(err_msg)
-                        raise RuntimeError(err_msg)
 
         except Exception as commit_err:
             print(f"物理提交过程捕获致命异常，正在启动完整原子回滚策略: {commit_err}")
