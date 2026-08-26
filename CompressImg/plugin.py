@@ -353,7 +353,7 @@ class CompressApp:
         
         self.prefs = self.load_prefs()
         
-        self.root.title("CompressImg-Pro V1.3")
+        self.root.title("CompressImg-Pro V1.1.3")
         self.root.geometry("1100x800")
         self.root.minsize(1050, 750)
         self.root.eval('tk::PlaceWindow . center')
