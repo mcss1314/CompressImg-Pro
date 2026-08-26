@@ -20,7 +20,7 @@ from urllib.parse import unquote, quote
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _VENDOR_DIR = _PLUGIN_DIR / "vendor"
-MAX_PIXELS = 100_000_000  # 100 Megapixels upper bound safety threshold
+MAX_PIXELS = 100_000_000  # 100 Megapixels 上限阈值
 
 def setup_environment():
     """初始化运行环境与 vendor 依赖包路径"""
@@ -45,23 +45,28 @@ setup_environment()
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 
-_RE_COVER_META_1 = re.compile(r'<meta\s+[^>]*?name=["\']cover["\']\s+content=["\']([^"\']+)["\']', re.IGNORECASE)
-_RE_COVER_META_2 = re.compile(r'<meta\s+[^>]*?content=["\']([^"\']+)["\']\s+name=["\']cover["\']', re.IGNORECASE)
+# 正则匹配表达式（已加入 \b 单词边界防误匹配 data-src / data-href）
+_RE_COVER_META_1 = re.compile(r'<meta\s+[^>]*?name=["\']cover["\']\s+content=["\']([^"\']+)["\']', re.IGNORECASE | re.DOTALL)
+_RE_COVER_META_2 = re.compile(r'<meta\s+[^>]*?content=["\']([^"\']+)["\']\s+name=["\']cover["\']', re.IGNORECASE | re.DOTALL)
 _RE_IMG_REF = re.compile(
-    r'(?:<(?:img|image|source)[^>]*?(?:src|xlink:href|href)\s*=\s*[\'"]([^\'"]+)[\'"]|url\(\s*[\'"]?([^\'"]+?)[\'"]?\s*\))',
-    re.IGNORECASE
+    r'(?:<(?:img|image|source)[^>]*?\b(?:src|xlink:href|href)\s*=\s*[\'"]([^\'"]+)[\'"]|url\(\s*[\'"]?([^\'"]+?)[\'"]?\s*\))',
+    re.IGNORECASE | re.DOTALL
 )
 _RE_SRCSET = re.compile(
     r'srcset\s*=\s*(?:(["\'])(.*?)(?:\1)|([^\s>]+))',
     re.IGNORECASE | re.DOTALL
 )
-_RE_HTML_IMG = re.compile(r'(<(?:img|image|source)[^>]*?(?:src|xlink:href|href)\s*=\s*)([\'"])(.*?)([\'"])([^>]*?>)', re.IGNORECASE)
+_RE_HTML_IMG = re.compile(
+    r'(<(?:img|image|source)[^>]*?\b(?:src|xlink:href|href)\s*=\s*)([\'"])(.*?)([\'"])([^>]*?>)', 
+    re.IGNORECASE | re.DOTALL
+)
 _RE_HTML_SRCSET = re.compile(
     r'(<(?:img|image|source)[^>]*?srcset\s*=\s*)(?:([\'"])(.*?)([\'"])|([^\s>]+))([^>]*?>)',
     re.IGNORECASE | re.DOTALL
 )
-_RE_CSS_URL = re.compile(r'(\burl\s*\(\s*)([\'"]?)(.*?)([\'"]?\s*\))', re.IGNORECASE)
-_RE_CSS_IMPORT = re.compile(r'(@import\s+)([\'"])(.*?)([\'"])', re.IGNORECASE)
+_RE_CSS_URL = re.compile(r'(\burl\s*\(\s*)([\'"]?)(.*?)([\'"]?\s*\))', re.IGNORECASE | re.DOTALL)
+_RE_CSS_IMPORT = re.compile(r'(@import\s+)([\'"])(.*?)([\'"])', re.IGNORECASE | re.DOTALL)
+_RE_TAG_BLOCK = re.compile(r'<[a-zA-Z0-9:]+\b[^>]*?>', re.IGNORECASE | re.DOTALL)
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.svg', '.tif', '.tiff', '.ico')
 
@@ -86,6 +91,23 @@ try:
 except Exception:
     HAS_IMAGEQUANT = False
 
+def get_image_mime(filename_or_ext):
+    """根据文件扩展名推论 EPUB / W3C 标准 MIME 类型"""
+    ext = posixpath.splitext(filename_or_ext)[1].lower().lstrip('.')
+    mime_map = {
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'webp': 'image/webp',
+        'gif': 'image/gif',
+        'svg': 'image/svg+xml',
+        'bmp': 'image/bmp',
+        'tif': 'image/tiff',
+        'tiff': 'image/tiff',
+        'ico': 'image/x-icon'
+    }
+    return mime_map.get(ext, 'image/jpeg')
+
 def split_url_suffix(url_str):
     """拆分 URL 路径与 Query / Hash 后缀"""
     q_idx = url_str.find('?')
@@ -103,66 +125,92 @@ def split_url_suffix(url_str):
         return url_str[:split_idx], url_str[split_idx:]
     return url_str, ""
 
+def canonical_epub_path(href):
+    """
+    统一 EPUB 容器绝对标准路径归一化。
+    彻底清理首部斜杠 /、连续斜杠与路径游标 ../，防止生成 OEBPS/Images/Images/... 等嵌套误判。
+    """
+    if not href:
+        return ""
+    clean, _ = split_url_suffix(href)
+    unquoted = unquote(clean).replace('\\', '/').strip()
+    norm = posixpath.normpath(unquoted).lstrip('/')
+    while norm.startswith('../'):
+        norm = norm[3:]
+    return posixpath.normpath(norm).lstrip('/')
+
 def normalize_epub_path(base_file_href, rel_url):
     """
     统一 EPUB 规范化路径计算。
-    支持相对路径 (../Images/pic.png) 与根绝对路径 (/Images/pic.png)。
+    支持相对路径与根绝对路径解析，并规约计算出 EPUB 根规范路径。
     """
     if not rel_url:
         return "", ""
         
     clean_url, extra_suffix = split_url_suffix(rel_url)
-    unquoted = unquote(clean_url).replace('\\', '/')
+    unquoted = unquote(clean_url).replace('\\', '/').strip()
     
-    if not unquoted or unquoted.startswith(('data:', 'http:', 'https:', 'mailto:', 'javascript:', 'ftp:')):
+    if not unquoted or unquoted.startswith(('data:', 'http:', 'https:', 'mailto:', 'javascript:', 'ftp:', '#')):
         return "", ""
         
-    # [优化 3] 应对 /Images/foo.jpg 等根路径引用
     if unquoted.startswith('/'):
-        norm_path = posixpath.normpath(unquoted.lstrip('/'))
+        norm_path = posixpath.normpath(unquoted.lstrip('/')).lstrip('/')
     elif base_file_href:
-        base_dir = posixpath.dirname(base_file_href)
-        norm_path = posixpath.normpath(posixpath.join(base_dir, unquoted))
+        base_dir = posixpath.dirname(canonical_epub_path(base_file_href))
+        norm_path = posixpath.normpath(posixpath.join(base_dir, unquoted)).lstrip('/')
     else:
-        norm_path = posixpath.normpath(unquoted)
+        norm_path = posixpath.normpath(unquoted).lstrip('/')
+        
+    while norm_path.startswith('../'):
+        norm_path = norm_path[3:]
+    norm_path = posixpath.normpath(norm_path).lstrip('/')
         
     return norm_path, extra_suffix
 
 def get_relative_epub_path(from_file_href, target_book_path):
-    """计算 from_file_href 到 target_book_path 的 POSIX 相对路径"""
-    from_dir = posixpath.dirname(from_file_href)
+    """计算从 from_file_href 所在地到 target_book_path 的 POSIX 相对路径"""
+    from_dir = posixpath.dirname(canonical_epub_path(from_file_href))
+    target_norm = canonical_epub_path(target_book_path)
     try:
-        rel = posixpath.relpath(target_book_path, from_dir)
+        rel = posixpath.relpath(target_norm, from_dir)
     except Exception:
-        rel = target_book_path
+        rel = target_norm
     return rel.replace('\\', '/')
 
 def safe_decode_text(data):
-    """[优化 4] 安全解析 XML/SVG/HTML 文本编码，避免盲目丢弃字节"""
+    """安全解析 XML/SVG/HTML 文本编码，返回 (decoded_text, is_bytes)"""
     if isinstance(data, str):
-        return data
+        return data, False
     if not isinstance(data, bytes):
-        return str(data)
+        return str(data), False
         
-    # 尝试解析 xml 头部声明的 encoding
     match = re.search(rb'^\s*<\?xml[^>]*encoding=["\']([^"\']+)["\']', data, re.IGNORECASE)
     if match:
         enc = match.group(1).decode('ascii', errors='ignore')
         try:
-            return data.decode(enc)
+            return data.decode(enc), True
         except (UnicodeDecodeError, LookupError):
             pass
             
     try:
-        return data.decode('utf-8')
+        return data.decode('utf-8'), True
     except UnicodeDecodeError:
         pass
         
-    # 终极降级方案：使用 replace 替换无法解析的字节，不破坏可解析的主要字符
-    return data.decode('utf-8', errors='replace')
+    return data.decode('utf-8', errors='replace'), True
+
+def update_xml_encoding_header(text, new_enc="utf-8"):
+    """更新 XML 头部的 encoding 声明为 new_enc，确保物理编码与 XML 头一致"""
+    return re.sub(
+        r'(^\s*<\?xml[^>]*?\bencoding=["\'])([^"\']+)(["\'])',
+        rf'\g<1>{new_enc}\g<3>',
+        text,
+        count=1,
+        flags=re.IGNORECASE
+    )
 
 def get_resample_filter(cur_w, cur_h, new_w, new_h):
-    """根据缩放比例动态选择重采样滤波器，避免大幅缩小时重度计算过载"""
+    """根据缩放比例动态选择重采样滤波器"""
     if Image is None:
         return None
 
@@ -175,7 +223,6 @@ def get_resample_filter(cur_w, cur_h, new_w, new_h):
         return filter_lanczos
 
     scale_ratio = (new_w * new_h) / float(cur_w * cur_h)
-    
     if scale_ratio < 0.25:
         return filter_box
     elif scale_ratio < 0.6:
@@ -184,7 +231,7 @@ def get_resample_filter(cur_w, cur_h, new_w, new_h):
     return filter_lanczos
 
 def convert_cmyk_to_rgb(img):
-    """更精确地将 CMYK / 印刷色彩空间转换为 RGB，避免色彩反转与失真"""
+    """转换 CMYK 印刷色彩空间为 RGB"""
     if img is None or img.mode != 'CMYK':
         return img
 
@@ -203,10 +250,7 @@ def convert_cmyk_to_rgb(img):
         return img
 
 def should_reencode_image(img_info, opts, img_obj):
-    """
-    [优化 1] 显式决策函数：统一判定图片是否需要重新编码。
-    防止 JPEG “无损压缩”下无像素修改却被有损重编码破坏图质。
-    """
+    """判定图片是否需要重新编码"""
     orig_fmt = img_obj.format if img_obj.format else img_info['format']
     if orig_fmt.upper() == 'JPG': orig_fmt = 'JPEG'
     
@@ -249,7 +293,6 @@ def should_reencode_image(img_info, opts, img_obj):
         if img_obj.mode != 'P':
             return True, target_fmt
 
-    # JPEG 无损判定：若原图即为 JPEG，且未做尺寸/旋转改变，亦无元数据剥离需求，跳过像素重编码
     is_lossless_mode = opts.get('do_lossless') or (opts.get('do_conv') and opts.get('conv_type') == 'lossless')
     if target_fmt == 'JPEG' and is_lossless_mode and orig_fmt == 'JPEG':
         if not opts.get('strip_meta'):
@@ -271,7 +314,7 @@ def should_reencode_image(img_info, opts, img_obj):
     return False, target_fmt
 
 def check_dependencies():
-    """检查依赖库 Pillow 是否安装并符合版本需求"""
+    """检查依赖库 Pillow 是否符合运行条件"""
     errors = []
     try:
         import PIL
@@ -292,26 +335,21 @@ def check_dependencies():
 
 class CompressApp:
     def __init__(self, root, bk):
-        """
-        Sigil 插件主控应用实例。
-        【线程安全规范】：Sigil 的 bk 对象是非线程安全的，所有涉及 bk 的读写必须全部在主 GUI 线程中运行。
-        """
         self.root = root
         self.bk = bk
-        self.images = []  # 存放从电子书提取的图片元数据
-        self.error_details = []  # 记录处理过程中发生的具体错误
-        self._ui_disabled = False  # 处理中的 UI 锁定保护标志
-        self._is_cancelled = False  # 生命周期与线程安全退出标志
-        self.temp_dir = None  # 磁盘临时缓存目录句柄
+        self.images = []
+        self.error_details = []
+        self._ui_disabled = False
+        self._is_cancelled = False
+        self.temp_dir = None
         self.executor = None
         
         self._check_queue_job = None
         self._scroll_job = None
         self._resize_job = None
         
-        # 内存索引缓存，避免频繁遍历 manifest
         self._existing_ids = set()
-        self._existing_basenames = set()
+        self._existing_bookpaths = set()
         
         self.prefs = self.load_prefs()
         
@@ -386,7 +424,7 @@ class CompressApp:
         atexit.register(self._cleanup_temp_dir)
 
     def close_app(self):
-        """[优化 7] 窗口关闭安全清理函数：标记取消标识并彻底杀死后台任务"""
+        """关闭程序时释放资源并清除异步调度任务"""
         self._is_cancelled = True
         try:
             atexit.unregister(self._cleanup_temp_dir)
@@ -404,7 +442,6 @@ class CompressApp:
 
         if hasattr(self, 'executor') and self.executor:
             try:
-                # 兼容 Python 3.9+ cancel_futures 参数
                 self.executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
                 self.executor.shutdown(wait=False)
@@ -420,7 +457,6 @@ class CompressApp:
             pass
 
     def load_prefs(self):
-        """从插件目录加载历史配置"""
         path = os.path.join(str(_PLUGIN_DIR), ".sigil_compress_plugin_prefs.json")
         if os.path.exists(path):
             try:
@@ -431,7 +467,6 @@ class CompressApp:
         return {}
 
     def save_prefs(self):
-        """保存当前配置到插件目录"""
         path = os.path.join(str(_PLUGIN_DIR), ".sigil_compress_plugin_prefs.json")
         
         def _to_int(val, default):
@@ -470,7 +505,7 @@ class CompressApp:
             print(f"保存配置失败: {e}")
 
     def init_data(self):
-        """遍历并读取 Sigil 电子书中所有图片的元数据（主线程上执行）"""
+        """遍历电子书图片库并规范化其标准绝对路径"""
         if self.bk is None:
             return
             
@@ -479,11 +514,11 @@ class CompressApp:
             for img_info in self.bk.image_iter():
                 try:
                     img_id = img_info[0]
-                    href = posixpath.normpath(img_info[1])
+                    href = canonical_epub_path(img_info[1])
                     
                     data = self.bk.readfile(img_id)
                     size = len(data) if data else 0
-                    filename = href.split('/')[-1]
+                    filename = posixpath.basename(href)
                     ext = filename.rsplit('.', 1)[-1].upper() if '.' in filename else 'UNKNOWN'
                     
                     w, h = 0, 0
@@ -512,7 +547,6 @@ class CompressApp:
             print(f"遍历电子书图片失败: {iter_err}")
 
     def build_ui(self):
-        """构建 UI 视图结构"""
         self._managed_widgets = []
         
         self.main_wrapper = ttk.Frame(self.root)
@@ -630,7 +664,6 @@ class CompressApp:
         self.refresh_tree()
 
     def _create_collapsible(self, parent, title, key):
-        """卡片收纳折叠容器"""
         card = ttk.Frame(parent)
         card.pack(fill=tk.X, padx=5, pady=4)
         
@@ -658,7 +691,7 @@ class CompressApp:
             foreground="#34495e", 
             background=self.bg_color, 
             cursor="hand2",
-                 anchor='w'
+            anchor='w'
         )
         lbl_title.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=4)
         
@@ -687,7 +720,6 @@ class CompressApp:
         return inner
 
     def build_right_panel(self, parent):
-        """构建右侧设置选项"""
         self.action_frame = ttk.Frame(parent)
         self.action_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
         
@@ -719,6 +751,7 @@ class CompressApp:
                     self.root.after_cancel(self._scroll_job)
                 except Exception:
                     pass
+                self._scroll_job = None
             if not getattr(self, '_is_cancelled', False):
                 self._scroll_job = self.root.after(15, _update_scroll_region)
             
@@ -735,6 +768,7 @@ class CompressApp:
                         self.root.after_cancel(self._resize_job)
                     except Exception:
                         pass
+                    self._resize_job = None
                 if not getattr(self, '_is_cancelled', False):
                     self._resize_job = self.root.after(15, lambda: _update_canvas_width(w))
             _update_scroll_region()
@@ -867,7 +901,7 @@ class CompressApp:
             self.var_colordepth_cmp.set(False)
         
         self.var_lossless_cmp = tk.BooleanVar(value=self.prefs.get('lossless_cmp', False))
-        chk_lossless_cmp = ttk.Checkbutton(inner_adv, text="启用无损压缩(JPEG高质量)", variable=self.var_lossless_cmp, command=lambda: self.on_mode_change('advanced'))
+        chk_lossless_cmp = ttk.Checkbutton(inner_adv, text="启用无损压缩 (JPEG高质量)", variable=self.var_lossless_cmp, command=lambda: self.on_mode_change('advanced'))
         chk_lossless_cmp.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
         
         ttk.Label(inner_adv, text="无损压缩级别:").grid(row=2, column=0, sticky=tk.W, pady=5)
@@ -896,7 +930,6 @@ class CompressApp:
         ])
 
     def _set_ui_enabled(self, enabled=True):
-        """处理过程中精准锁定/解锁 UI 控件"""
         self._ui_disabled = not enabled
         tk_state = tk.NORMAL if enabled else tk.DISABLED
         
@@ -920,7 +953,6 @@ class CompressApp:
             self.check_run_state()
 
     def on_mode_change(self, active_mode):
-        """处理三大压缩类别的互斥逻辑"""
         if getattr(self, '_ui_disabled', False):
             return
             
@@ -943,7 +975,6 @@ class CompressApp:
         self.update_states()
 
     def update_states(self):
-        """根据复选框状态动态开启或置灰功能控件"""
         if getattr(self, '_ui_disabled', False):
             return
 
@@ -983,7 +1014,6 @@ class CompressApp:
         self.check_run_state()
 
     def check_run_state(self):
-        """检查是否有图片被选中以及是否有生效配置项"""
         if not hasattr(self, 'btn_run') or getattr(self, '_ui_disabled', False):
             return
             
@@ -1005,7 +1035,6 @@ class CompressApp:
             self.btn_run.config(state=tk.DISABLED)
 
     def refresh_tree(self):
-        """重新绘制 Treeview 图片表格"""
         self._is_refreshing = True
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1047,7 +1076,6 @@ class CompressApp:
         self.check_run_state()
 
     def on_tree_select(self, event):
-        """同步 Treeview 选中项状态至数据模型"""
         if getattr(self, '_is_refreshing', False) or getattr(self, '_ui_disabled', False):
             return
             
@@ -1113,7 +1141,6 @@ class CompressApp:
                 self.preview_image(self.images[idx])
 
     def preview_image(self, img_info):
-        """双击弹窗预览选中的图片"""
         if self.bk is None:
             return
             
@@ -1177,10 +1204,6 @@ class CompressApp:
             messagebox.showerror("预览失败", f"无法加载并预览图片: {e}", parent=self.root)
 
     def _get_cover_hrefs_and_ids(self):
-        """
-        [优化 5] 精准识别电子书封面图片与封面 HTML。
-        仅依赖 EPUB 标准元数据与清单属性，排除宽泛的文件名前缀误判。
-        """
         cover_hrefs = set()
         cover_ids = set()
         cover_html_hrefs = set()
@@ -1198,7 +1221,7 @@ class CompressApp:
                     try:
                         href = self.bk.id_to_href(cid)
                         if href:
-                            cover_hrefs.add(posixpath.normpath(href))
+                            cover_hrefs.add(canonical_epub_path(href))
                     except Exception:
                         pass
         except Exception:
@@ -1207,7 +1230,7 @@ class CompressApp:
         try:
             for item in self.bk.manifest_iter():
                 item_id = item[0]
-                item_href = posixpath.normpath(item[1])
+                item_href = canonical_epub_path(item[1])
                 props = str(item[3]) if len(item) >= 4 and item[3] else ""
                 
                 if 'cover-image' in props:
@@ -1216,7 +1239,6 @@ class CompressApp:
                 if 'cover' in props and ('html' in item_href.lower() or 'xhtml' in item_href.lower()):
                     cover_html_ids.add(item_id)
                     cover_html_hrefs.add(item_href)
-                # 严格精确判定 ID，不再采用 filename.startswith('cover.') 误杀普通图片
                 if item_id.lower() in ('cover', 'cover-image', 'cover_image'):
                     if any(item_href.lower().endswith(ext) for ext in IMAGE_EXTENSIONS):
                         cover_ids.add(item_id)
@@ -1227,7 +1249,6 @@ class CompressApp:
         return cover_hrefs, cover_ids, cover_html_hrefs, cover_html_ids
 
     def _get_html_file_contents(self):
-        """主线程安全提取所有 HTML 与 SVG 文件内容（支持安全编码解析）"""
         if self.bk is None:
             return []
 
@@ -1235,14 +1256,14 @@ class CompressApp:
         if hasattr(self.bk, 'spine_iter'):
             try:
                 for item in self.bk.spine_iter():
-                    text_files.append((item[0], posixpath.normpath(item[1])))
+                    text_files.append((item[0], canonical_epub_path(item[1])))
             except Exception:
                 pass
         if not text_files:
             if hasattr(self.bk, 'text_iter'):
                 try:
                     for item in self.bk.text_iter():
-                        text_files.append((item[0], posixpath.normpath(item[1])))
+                        text_files.append((item[0], canonical_epub_path(item[1])))
                 except Exception:
                     pass
 
@@ -1250,7 +1271,7 @@ class CompressApp:
             try:
                 for item in self.bk.manifest_iter():
                     item_id = item[0]
-                    item_href = posixpath.normpath(item[1])
+                    item_href = canonical_epub_path(item[1])
                     if item_href.lower().endswith('.svg') and (item_id, item_href) not in text_files:
                         text_files.append((item_id, item_href))
             except Exception:
@@ -1260,18 +1281,16 @@ class CompressApp:
         for html_id, html_href in text_files:
             try:
                 data = self.bk.readfile(html_id)
-                # [优化 4] 安全解码文本
-                text = safe_decode_text(data)
+                text, _ = safe_decode_text(data)
                 contents.append((html_id, html_href, text))
             except Exception as e:
                 print(f"读取文本/SVG文件 {html_href} 内容失败: {e}")
         return contents
 
     def _compute_rename_stems(self, selected_imgs, cover_info, html_contents):
-        """后台计算重命名 Stem（纯内存计算）"""
         cover_hrefs, cover_ids, cover_html_hrefs, cover_html_ids = cover_info
         
-        href_to_imgid = {img['href']: img['id'] for img in self.images}
+        href_to_imgid = {canonical_epub_path(img['href']): img['id'] for img in self.images}
         img_call_positions = {img['id']: [] for img in self.images}
         call_counter = 0
         
@@ -1280,31 +1299,35 @@ class CompressApp:
                 continue
                 
             try:
-                found_urls = []
-                for m in _RE_IMG_REF.finditer(html_text):
-                    url = m.group(1) or m.group(2)
-                    if url:
-                        found_urls.append(url)
-                        
-                for m in _RE_SRCSET.finditer(html_text):
-                    srcset_val = m.group(2) if m.group(1) else m.group(3)
-                    if srcset_val:
-                        for part in srcset_val.split(','):
-                            tokens = part.strip().split()
-                            if tokens:
-                                found_urls.append(tokens[0])
+                for tag_match in _RE_TAG_BLOCK.finditer(html_text):
+                    tag_text = tag_match.group(0)
+                    tag_urls = []
+                    
+                    for m in _RE_IMG_REF.finditer(tag_text):
+                        url = m.group(1) or m.group(2)
+                        if url:
+                            tag_urls.append(url)
                             
-                for raw_url in found_urls:
-                    book_path, _ = normalize_epub_path(html_href, raw_url)
-                    if not book_path:
-                        continue
-                        
-                    matched_img_id = href_to_imgid.get(book_path)
-                                
-                    if matched_img_id and matched_img_id in img_call_positions:
-                        if matched_img_id in cover_ids:
+                    for m in _RE_SRCSET.finditer(tag_text):
+                        srcset_val = m.group(2) if m.group(1) else m.group(3)
+                        if srcset_val:
+                            candidates = re.split(r',\s+(?=[^\s,]+)', srcset_val.strip())
+                            for cand in candidates:
+                                tokens = cand.strip().split()
+                                if tokens:
+                                    tag_urls.append(tokens[0])
+                                    
+                    matched_ids_in_tag = []
+                    for raw_url in tag_urls:
+                        book_path, _ = normalize_epub_path(html_href, raw_url)
+                        if not book_path:
                             continue
-                            
+                        matched_img_id = href_to_imgid.get(canonical_epub_path(book_path))
+                        if matched_img_id and matched_img_id in img_call_positions and matched_img_id not in cover_ids:
+                            if matched_img_id not in matched_ids_in_tag:
+                                matched_ids_in_tag.append(matched_img_id)
+                                
+                    for matched_img_id in matched_ids_in_tag:
                         call_counter += 1
                         if call_counter not in img_call_positions[matched_img_id]:
                             img_call_positions[matched_img_id].append(call_counter)
@@ -1318,7 +1341,7 @@ class CompressApp:
         final_stems = {}
         for img in selected_imgs:
             img_id = img['id']
-            img_href = img['href']
+            img_href = canonical_epub_path(img['href'])
             
             if img_id in cover_ids or img_href in cover_hrefs:
                 continue
@@ -1337,7 +1360,6 @@ class CompressApp:
         return final_stems
 
     def _fill_executor(self, opts):
-        """流式并发调度任务"""
         if self.bk is None or getattr(self, '_is_cancelled', False) or not hasattr(self, 'executor') or self.executor is None:
             return
             
@@ -1359,7 +1381,6 @@ class CompressApp:
                     self.q.put((False, img_info['id'], err_msg, None))
 
     def _write_binary_file(self, file_id, data):
-        """向 Sigil 书包 (bk) 安全写入二进制数据"""
         if data is None:
             return
         if isinstance(data, str):
@@ -1369,7 +1390,6 @@ class CompressApp:
         self.bk.writefile(file_id, data)
 
     def _cleanup_temp_dir(self):
-        """清理临时磁盘文件"""
         if getattr(self, 'temp_dir', None) is not None:
             try:
                 self.temp_dir.cleanup()
@@ -1378,7 +1398,6 @@ class CompressApp:
             self.temp_dir = None
 
     def _get_staged_data(self, item):
-        """获取暂存图片字节（优先从磁盘读取）"""
         temp_path = item.get('temp_path')
         if temp_path and os.path.exists(temp_path):
             try:
@@ -1390,28 +1409,28 @@ class CompressApp:
         return item.get('data')
 
     def run_process(self):
-        """准备参数并启动处理任务"""
         if getattr(self, '_ui_disabled', False) or self.bk is None:
             return
             
         self._is_cancelled = False
             
-        def validate_sp(widget, min_v, max_v, default_v):
+        def sanitize_sp(widget, min_v, max_v, default_v):
             try:
-                val = int(widget.get())
+                val = int(widget.get().strip())
                 if not (min_v <= val <= max_v):
-                    raise ValueError
+                    val = max(min_v, min(val, max_v))
+                    widget.set(val)
                 return val
-            except ValueError:
+            except Exception:
                 widget.set(default_v)
-                return None
+                return default_v
 
-        conv_qlty = validate_sp(self.sp_conv_qlty, 5, 100, 80)
-        jpg_qlty = validate_sp(self.sp_jpeg_qlty, 5, 95, 80)
-        webp_qlty = validate_sp(self.sp_webp_qlty, 5, 100, 80)
-        scale_percent = validate_sp(self.sp_scale_percent, 1, 500, 50)
-        scale_width = validate_sp(self.sp_scale_width, 1, 10000, 800)
-        scale_height = validate_sp(self.sp_scale_height, 1, 10000, 800)
+        conv_qlty = sanitize_sp(self.sp_conv_qlty, 5, 100, 80)
+        jpg_qlty = sanitize_sp(self.sp_jpeg_qlty, 5, 95, 80)
+        webp_qlty = sanitize_sp(self.sp_webp_qlty, 5, 100, 80)
+        scale_percent = sanitize_sp(self.sp_scale_percent, 1, 500, 50)
+        scale_width = sanitize_sp(self.sp_scale_width, 1, 10000, 800)
+        scale_height = sanitize_sp(self.sp_scale_height, 1, 10000, 800)
         
         try:
             adv_lossless_lvl = int(self.combo_adv_lossless.get().replace("级", ""))
@@ -1422,15 +1441,6 @@ class CompressApp:
             conv_lossless_lvl = int(self.combo_conv_lossless_level.get().replace("级", ""))
         except ValueError:
             conv_lossless_lvl = 2
-        
-        if None in (conv_qlty, jpg_qlty, webp_qlty, scale_percent, scale_width, scale_height):
-            self.btn_run.config(style="Error.TButton", state=tk.DISABLED, text="❌ 执 行 失 败")
-            if not getattr(self, '_is_cancelled', False):
-                self.root.after(1500, lambda: (
-                    self.btn_run.config(style="Accent.TButton", text="🚀 执 行 处 理"),
-                    self.check_run_state()
-                ))
-            return
             
         self.save_prefs()
         
@@ -1490,13 +1500,13 @@ class CompressApp:
             self.prep_q = queue.Queue()
             self._prep_status = 'pending'
             
-            # [优化 6] 一次性初始化 manifest 索引集合，避免后续在循环中频繁重读
+            # P1 修复：收集标准 EPUB 物理 Bookpath 集合，保留跨子目录组织架构
             try:
                 self._existing_ids = {info[0] for info in self.bk.manifest_iter()}
-                self._existing_basenames = {info[1].split('/')[-1] for info in self.bk.manifest_iter()}
+                self._existing_bookpaths = {canonical_epub_path(self.bk.id_to_bookpath(info[0])) for info in self.bk.manifest_iter()}
             except Exception:
                 self._existing_ids = set()
-                self._existing_basenames = set()
+                self._existing_bookpaths = set()
             
             self.threads = os.cpu_count() or 4
             self.executor = ThreadPoolExecutor(max_workers=self.threads)
@@ -1519,7 +1529,6 @@ class CompressApp:
             self._set_ui_enabled(True)
 
     def _async_prepare(self, selected_imgs, opts, cover_info=None, html_contents=None):
-        """后台异步计算任务"""
         if getattr(self, '_is_cancelled', False):
             return
         try:
@@ -1534,20 +1543,19 @@ class CompressApp:
                 self.prep_q.put((False, err_msg))
 
     def process_single_image(self, img_info, opts, raw_data):
-        """工作线程：基于决策函数进行图片处理"""
         if getattr(self, '_is_cancelled', False):
             return
 
         try:
             with Image.open(BytesIO(raw_data)) as img:
-                img = ImageOps.exif_transpose(img)
-                img = convert_cmyk_to_rgb(img)
-
                 is_animated = getattr(img, 'is_animated', False) and getattr(img, 'n_frames', 1) > 1
                 if is_animated:
                     if not getattr(self, '_is_cancelled', False):
                         self.q.put((True, img_info['id'], None, img_info['format']))
                     return
+
+                img = ImageOps.exif_transpose(img)
+                img = convert_cmyk_to_rgb(img)
 
                 needs_reencode, target_fmt = should_reencode_image(img_info, opts, img)
                 if not needs_reencode:
@@ -1653,7 +1661,6 @@ class CompressApp:
                         
                     lvl = opts['conv_lossless_level'] if is_conv_lossless else opts['lossless_level']
                     
-                    # [优化 1] 若 JPEG 强制重新编码且处于无损模式下，采用最高采样质量参数
                     if target_fmt == 'JPEG':
                         save_kwargs['quality'] = 95
                         save_kwargs['subsampling'] = 0
@@ -1692,7 +1699,6 @@ class CompressApp:
                 self.q.put((False, img_info['id'], f"未知处理异常: {e}\n{err_tb}", None))
 
     def check_queue(self, total, opts):
-        """UI 轮询机制"""
         self._check_queue_job = None
         
         if getattr(self, '_is_cancelled', False):
@@ -1747,8 +1753,14 @@ class CompressApp:
                             except Exception as e:
                                 print(f"写入临时文件失败: {e}")
 
-                        old_href = posixpath.normpath(self.bk.id_to_href(img_id))
-                        old_basename = old_href.split('/')[-1]
+                        # 修复：区分 Manifest href (OPF 相对路径) 与 Zip Root bookpath (容器绝对路径)
+                        old_href = canonical_epub_path(self.bk.id_to_href(img_id))
+                        old_bookpath = canonical_epub_path(self.bk.id_to_bookpath(img_id)) if hasattr(self.bk, 'id_to_bookpath') else old_href
+                        
+                        old_basename = posixpath.basename(old_bookpath)
+                        old_bookpath_dir = posixpath.dirname(old_bookpath)
+                        old_href_dir = posixpath.dirname(old_href)
+                        
                         old_ext = old_basename.rsplit('.', 1)[-1].upper() if '.' in old_basename else 'PNG'
                         if old_ext == 'JPG': old_ext = 'JPEG'
                         
@@ -1763,31 +1775,37 @@ class CompressApp:
                         else:
                             name_part = old_basename.rsplit('.', 1)[0]
                             
-                        new_basename = f"{name_part}.{new_ext}"
+                        candidate_basename = f"{name_part}.{new_ext}"
+                        candidate_bookpath = canonical_epub_path(posixpath.join(old_bookpath_dir, candidate_basename)) if old_bookpath_dir else candidate_basename
+                        candidate_href = canonical_epub_path(posixpath.join(old_href_dir, candidate_basename)) if old_href_dir else candidate_basename
                         
-                        if new_basename != old_basename:
-                            clean_stem = re.sub(r'[^\w\-]', '_', name_part)
-                            new_id = f"img_{clean_stem}_{new_ext}"
-                            
-                            # [优化 6] 直接更新 Python 内存 Set，剔除原本重复遍历 self.bk.manifest_iter() 的开销
+                        if candidate_bookpath != old_bookpath or is_batch_renamed:
                             self._existing_ids.discard(img_id)
-                            self._existing_basenames.discard(old_basename)
+                            self._existing_bookpaths.discard(old_bookpath)
                             
-                            counter = 1
-                            base_new_id = new_id
-                            while new_id in self._existing_ids or new_basename in self._existing_basenames:
-                                new_id = f"{base_new_id}_{counter}"
-                                new_basename = f"{name_part}_{counter}.{new_ext}"
-                                counter += 1
-                                
+                            clean_stem = re.sub(r'[^\w\-]', '_', name_part)
+                            base_new_id = f"img_{clean_stem}_{new_ext}"
+                            new_id = base_new_id
+                            
+                            # P1 修复解耦 1：独立解决 Manifest ID 命名空间冲突
+                            id_counter = 1
+                            while new_id in self._existing_ids:
+                                new_id = f"{base_new_id}_{id_counter}"
+                                id_counter += 1
                             self._existing_ids.add(new_id)
-                            self._existing_basenames.add(new_basename)
                             
-                            if '/' in old_href:
-                                new_href = posixpath.normpath(old_href.rsplit('/', 1)[0] + '/' + new_basename)
-                            else:
-                                new_href = new_basename
-                                
+                            # P1 修复解耦 2：独立解决 EPUB 物理 Bookpath 冲突（精准保留 OEBPS/Images/ 架构）
+                            new_basename = candidate_basename
+                            new_bookpath = candidate_bookpath
+                            new_href = candidate_href
+                            href_counter = 1
+                            while new_bookpath in self._existing_bookpaths:
+                                new_basename = f"{name_part}_{href_counter}.{new_ext}"
+                                new_bookpath = canonical_epub_path(posixpath.join(old_bookpath_dir, new_basename)) if old_bookpath_dir else new_basename
+                                new_href = canonical_epub_path(posixpath.join(old_href_dir, new_basename)) if old_href_dir else new_basename
+                                href_counter += 1
+                            self._existing_bookpaths.add(new_bookpath)
+                            
                             self.staged_id_map[img_id] = new_id
                             self.staged_href_map[old_href] = new_href
                             
@@ -1797,6 +1815,8 @@ class CompressApp:
                                 'new_basename': new_basename,
                                 'old_href': old_href,
                                 'new_href': new_href,
+                                'old_bookpath': old_bookpath,
+                                'new_bookpath': new_bookpath,
                                 'temp_path': temp_path,
                                 'data': result,
                                 'action': 'add_delete'
@@ -1808,6 +1828,8 @@ class CompressApp:
                                 'new_basename': old_basename,
                                 'old_href': old_href,
                                 'new_href': old_href,
+                                'old_bookpath': old_bookpath,
+                                'new_bookpath': old_bookpath,
                                 'temp_path': temp_path,
                                 'data': result,
                                 'action': 'write' if (temp_path or result is not None) else 'none'
@@ -1829,13 +1851,22 @@ class CompressApp:
 
         if getattr(self, '_is_cancelled', False):
             return
+
+        # P0 修复：在 Future 轮询中捕获 Worker 线程崩溃，防止 processed_count 死锁
+        done_futures = [f for f in self.active_futures if f.done()]
+        for f in done_futures:
+            img_id = self.active_futures.pop(f)
+            try:
+                exc = f.exception()
+                if exc is not None:
+                    err_msg = f"Worker 线程处理图片 ({img_id}) 发生未捕获致命崩溃: {exc}"
+                    print(err_msg)
+                    self.q.put((False, img_id, err_msg, None))
+            except Exception:
+                pass
             
         progress_percent = int((self.processed_count / total) * 100) if total > 0 else 0
         self.btn_run.config(text=f"⚙ 处理进度 {progress_percent}%")
-            
-        done_futures = [f for f in self.active_futures if f.done()]
-        for f in done_futures:
-            del self.active_futures[f]
             
         self._fill_executor(opts)
             
@@ -1854,6 +1885,8 @@ class CompressApp:
                 except Exception as commit_exc:
                     err_msg = f"提交物理变更发生未预期异常: {commit_exc}"
                     print(err_msg)
+                    # P2 修复：致命异常补全 error_count += 1
+                    self.error_count += 1
                     if err_msg not in self.error_details:
                         self.error_details.append(err_msg)
             else:
@@ -1868,6 +1901,12 @@ class CompressApp:
                 
                 if self.error_details:
                     self._show_error_summary()
+                else:
+                    messagebox.showinfo(
+                        "处理完成", 
+                        "图片处理完成并已成功刷入 Sigil 缓冲区！\n\n提示：根据 Sigil 插件工作机制，请关闭本插件窗口，Sigil 主界面将自动刷新并呈现最新更改。", 
+                        parent=self.root
+                    )
                 
                 self.images = []
                 self.init_data()
@@ -1904,8 +1943,9 @@ class CompressApp:
             if raw_ext and raw_ext not in IMAGE_EXTENSIONS:
                 return match.group(0)
 
-            if book_path in self.staged_href_map:
-                new_book_path = self.staged_href_map[book_path]
+            norm_book_path = canonical_epub_path(book_path)
+            if norm_book_path in self.staged_href_map:
+                new_book_path = self.staged_href_map[norm_book_path]
                 new_rel_path = get_relative_epub_path(current_file_href, new_book_path)
                 encoded_rel_path = quote(new_rel_path, safe='/')
                 new_href = encoded_rel_path + extra_suffix
@@ -1915,6 +1955,7 @@ class CompressApp:
             return f"{prefix}{quote1}{new_href}{quote2}{suffix}" if len(groups) == 5 else f"{prefix}{quote1}{new_href}{suffix}"
 
         def _srcset_replacer(match, current_file_href):
+            """P3 修复：基于候选地址规范分割 srcset，防转义逗号及 Data URI 截断"""
             groups = match.groups()
             prefix = groups[0]
             if groups[1] is not None:
@@ -1930,63 +1971,61 @@ class CompressApp:
             if not srcset_val:
                 return match.group(0)
 
-            parts = srcset_val.split(',')
-            new_parts = []
+            candidates = re.split(r',\s+(?=[^\s,]+)', srcset_val.strip())
+            new_candidates = []
 
-            for part in parts:
-                stripped_part = part.strip()
-                if not stripped_part:
+            for cand in candidates:
+                cand_str = cand.strip()
+                if not cand_str:
                     continue
 
-                tokens = stripped_part.split()
-                if not tokens:
-                    new_parts.append(part)
-                    continue
+                parts = cand_str.split(None, 1)
+                raw_url = parts[0]
+                descriptor = f" {parts[1]}" if len(parts) > 1 else ""
 
-                raw_url = tokens[0]
                 book_path, extra_suffix = normalize_epub_path(current_file_href, raw_url)
                 if not book_path:
-                    new_parts.append(part)
+                    new_candidates.append(cand_str)
                     continue
 
                 raw_ext = posixpath.splitext(book_path.lower())[1]
                 if raw_ext and raw_ext not in IMAGE_EXTENSIONS:
-                    new_parts.append(part)
+                    new_candidates.append(cand_str)
                     continue
 
-                if book_path in self.staged_href_map:
-                    new_book_path = self.staged_href_map[book_path]
+                norm_book_path = canonical_epub_path(book_path)
+                if norm_book_path in self.staged_href_map:
+                    new_book_path = self.staged_href_map[norm_book_path]
                     new_rel_path = get_relative_epub_path(current_file_href, new_book_path)
                     encoded_rel_path = quote(new_rel_path, safe='/')
-                    tokens[0] = encoded_rel_path + extra_suffix
+                    raw_url = encoded_rel_path + extra_suffix
 
-                new_parts.append(" ".join(tokens))
+                new_candidates.append(raw_url + descriptor)
 
-            new_srcset = ", ".join(new_parts)
+            new_srcset = ", ".join(new_candidates)
             return f"{prefix}{quote1}{new_srcset}{quote2}{suffix}"
 
         try:
             if hasattr(self.bk, 'text_iter'):
                 for html_id, raw_html_href in self.bk.text_iter():
-                    html_href = posixpath.normpath(raw_html_href)
+                    html_href = canonical_epub_path(raw_html_href)
                     html_data = self.bk.readfile(html_id)
-                    is_bytes = isinstance(html_data, bytes)
-                    # [优化 4] 使用 safe_decode_text 统一安全解码
-                    text = safe_decode_text(html_data)
+                    text, is_bytes = safe_decode_text(html_data)
 
                     new_text = _RE_HTML_IMG.sub(lambda m, h=html_href: _url_replacer(m, h), text)
                     new_text = _RE_HTML_SRCSET.sub(lambda m, h=html_href: _srcset_replacer(m, h), new_text)
                     new_text = _RE_CSS_URL.sub(lambda m, h=html_href: _url_replacer(m, h), new_text)
 
                     if text != new_text:
+                        # P2 修复：同步更新 XML 头部声明为 UTF-8
+                        new_text = update_xml_encoding_header(new_text, "utf-8")
                         staged_writes[html_id] = new_text.encode('utf-8') if is_bytes else new_text
 
             if hasattr(self.bk, 'css_iter'):
                 for css_id, raw_css_href in self.bk.css_iter():
-                    css_href = posixpath.normpath(raw_css_href)
+                    css_href = canonical_epub_path(raw_css_href)
                     css_data = self.bk.readfile(css_id)
-                    is_bytes = isinstance(css_data, bytes)
-                    text = safe_decode_text(css_data)
+                    text, is_bytes = safe_decode_text(css_data)
 
                     new_text = _RE_CSS_URL.sub(lambda m, h=css_href: _url_replacer(m, h), text)
                     new_text = _RE_CSS_IMPORT.sub(lambda m, h=css_href: _url_replacer(m, h), new_text)
@@ -1997,19 +2036,19 @@ class CompressApp:
             if hasattr(self.bk, 'manifest_iter'):
                 for item in self.bk.manifest_iter():
                     svg_id = item[0]
-                    svg_href = posixpath.normpath(item[1])
+                    svg_href = canonical_epub_path(item[1])
                     if svg_href.lower().endswith('.svg'):
                         svg_data = self.bk.readfile(svg_id)
                         if not svg_data:
                             continue
-                        is_bytes = isinstance(svg_data, bytes)
-                        text = safe_decode_text(svg_data)
+                        text, is_bytes = safe_decode_text(svg_data)
 
                         new_text = _RE_HTML_IMG.sub(lambda m, h=svg_href: _url_replacer(m, h), text)
                         new_text = _RE_HTML_SRCSET.sub(lambda m, h=svg_href: _srcset_replacer(m, h), new_text)
                         new_text = _RE_CSS_URL.sub(lambda m, h=svg_href: _url_replacer(m, h), new_text)
 
                         if text != new_text:
+                            new_text = update_xml_encoding_header(new_text, "utf-8")
                             staged_writes[svg_id] = new_text.encode('utf-8') if is_bytes else new_text
 
             if self.staged_id_map:
@@ -2040,24 +2079,25 @@ class CompressApp:
             return {}, None, False
 
     def _commit_all_changes(self, staged_writes, staged_metadata):
-        """
-        Phase 2: 提交变更到 Sigil EPUB 容器。
-        [优化 2] 增强原子回滚机制：备份图片二进制、文本及 OPF 元数据，遇错完全还原。
-        """
+        """Phase 2: 提交变更到 Sigil EPUB 容器，具备原子备份与还原回滚策略"""
         added_ids = []
-        written_backups = {}  # {img_id: original_raw_bytes}
-        text_backups = {}     # {file_id: original_raw_content}
+        written_backups = {}   # {img_id: original_raw_bytes}
+        deleted_backups = {}   # {img_id: (old_bookpath, original_raw_bytes, original_mime)}
+        text_backups = {}      # {file_id: original_raw_content}
         original_metadata = None
         
         try:
-            # 1. 备份图片原始字节
+            # 1. 备份覆盖与将被删除的原图片数据（使用物理 Bookpath 路径）
             for item in self.staged_images:
-                if item['action'] == 'write' and (item.get('temp_path') or item.get('data') is not None):
-                    orig_data = self.bk.readfile(item['id'])
-                    if orig_data is not None:
+                orig_data = self.bk.readfile(item['id'])
+                if orig_data is not None:
+                    if item['action'] == 'write':
                         written_backups[item['id']] = orig_data
+                    elif item['action'] == 'add_delete':
+                        orig_mime = get_image_mime(item['old_bookpath'])
+                        deleted_backups[item['id']] = (item['old_bookpath'], orig_data, orig_mime)
 
-            # 2. [优化 2] 备份将要被修改的文本与 OPF 元数据内容
+            # 2. 备份文本与元数据
             for file_id in staged_writes.keys():
                 orig_text = self.bk.readfile(file_id)
                 if orig_text is not None:
@@ -2066,7 +2106,7 @@ class CompressApp:
             if staged_metadata:
                 original_metadata = self.bk.getmetadataxml()
 
-            # 步骤一：添加新图片
+            # 步骤一：添加新图片（使用完整容器路径 new_bookpath，精准写入 OEBPS/Images/ 等子目录）
             for item in self.staged_images:
                 if item['action'] == 'add_delete':
                     data = self._get_staged_data(item)
@@ -2076,8 +2116,9 @@ class CompressApp:
                     if isinstance(data, str):
                         data = data.encode('utf-8')
                     
+                    mime_type = get_image_mime(item['new_basename'])
                     try:
-                        self.bk.addfile(item['new_id'], item['new_href'], data)
+                        self.bk.addbookpath(item['new_id'], item['new_bookpath'], data, mime=mime_type)
                         added_ids.append(item['new_id'])
                     except Exception as add_err:
                         raise RuntimeError(f"添加新图片 '{item['new_basename']}' (ID: {item['new_id']}) 失败: {add_err}")
@@ -2093,7 +2134,7 @@ class CompressApp:
                             raise RuntimeError(f"覆写图片 '{item['id']}' 内容失败: {write_err}")
                     self.success_count += 1
 
-            # 步骤三：更新 HTML / CSS / SVG 文件
+            # 步骤三：更新文本引用
             for file_id, content in staged_writes.items():
                 try:
                     self.bk.writefile(file_id, content)
@@ -2105,25 +2146,31 @@ class CompressApp:
                 except Exception as ref_err:
                     raise RuntimeError(f"更新 HTML/CSS/SVG 引用文件 '{file_id}' 失败: {ref_err}")
 
+            # 步骤四：写入元数据 XML
             if staged_metadata:
                 try:
                     self.bk.setmetadataxml(staged_metadata)
                 except Exception as meta_err:
                     raise RuntimeError(f"更新元数据 (OPF) 失败: {meta_err}")
 
-            # 步骤四：物理删除旧文件
+            # 步骤五：物理删除旧文件（成功才自增；失败则抛出异常触发全量回滚）
             for item in self.staged_images:
                 if item['action'] == 'add_delete':
                     try:
                         self.bk.deletefile(item['id'])
+                        self.success_count += 1
                     except Exception as del_err:
-                        print(f"警告: 清除原旧图片 '{item['id']}' 失败: {del_err}")
-                    self.success_count += 1
+                        err_msg = f"清除原旧图片 '{item['id']}' 物理文件失败: {del_err}"
+                        print(f"警告: {err_msg}")
+                        self.error_count += 1
+                        if err_msg not in self.error_details:
+                            self.error_details.append(err_msg)
+                        raise RuntimeError(err_msg)
 
         except Exception as commit_err:
             print(f"物理提交过程捕获致命异常，正在启动完整原子回滚策略: {commit_err}")
             
-            # 回滚 1：删除新添加的图片
+            # 回滚 1：删除已添加的新图片
             for rollback_id in list(added_ids):
                 try:
                     self.bk.deletefile(rollback_id)
@@ -2131,7 +2178,15 @@ class CompressApp:
                     print(f"回滚删除已添加图片 '{rollback_id}' 失败: {rb_e}")
             added_ids.clear()
 
-            # 回滚 2：还原覆盖的图片
+            # 回滚 2：精准按 Bookpath 还原已被删除的原图片（显式传递 orig_mime）
+            for del_id, (old_bookpath, orig_bytes, orig_mime) in deleted_backups.items():
+                try:
+                    self.bk.addbookpath(del_id, old_bookpath, orig_bytes, mime=orig_mime)
+                except Exception as rb_d:
+                    print(f"回滚恢复已被删除图片 '{del_id}' 失败: {rb_d}")
+            deleted_backups.clear()
+
+            # 回滚 3：还原覆写的图片
             for write_id, orig_bytes in written_backups.items():
                 try:
                     self._write_binary_file(write_id, orig_bytes)
@@ -2139,7 +2194,7 @@ class CompressApp:
                     print(f"回滚还原已覆盖图片 '{write_id}' 失败: {rb_w}")
             written_backups.clear()
 
-            # 回滚 3：还原修改的 HTML/CSS/SVG 文本
+            # 回滚 4：还原 HTML/CSS/SVG 文本
             for file_id, orig_content in text_backups.items():
                 try:
                     self.bk.writefile(file_id, orig_content)
@@ -2147,7 +2202,7 @@ class CompressApp:
                     print(f"回滚还原文本文件 '{file_id}' 失败: {rb_t}")
             text_backups.clear()
 
-            # 回滚 4：还原 OPF 元数据
+            # 回滚 5：还原 OPF 元数据
             if original_metadata:
                 try:
                     self.bk.setmetadataxml(original_metadata)
@@ -2161,7 +2216,6 @@ class CompressApp:
             raise
 
     def _show_error_summary(self):
-        """异常信息汇总窗口"""
         if not self.error_details or getattr(self, '_is_cancelled', False):
             return
 
@@ -2234,7 +2288,7 @@ def run(bk):
         guide_win.geometry("600x360")
         
         ui_font = ("微软雅黑" if sys.platform == "win32" else "Helvetica Neue" if sys.platform == "darwin" else "sans-serif", 10)
-        code_font = ("Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "monospace", 10)
+        code_font = ("Consolas" if sys.platform == "win32" else "Menlo" if sys.platform == "darwin" else "sans-serif", 10)
         
         guide_win.update_idletasks()
         win_x = (guide_win.winfo_screenwidth() // 2) - (600 // 2)
